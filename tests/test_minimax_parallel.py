@@ -1,10 +1,15 @@
 import ast
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+
+import torch
 
 
 ROOT = Path(__file__).parents[3]
 CORE = ROOT / "comfy/ldm/minimax/model.py"
 RAYLIGHT = ROOT / "custom_nodes/raylight/src/raylight/diffusion_models/minimax/xdit_context_parallel.py"
+USP = ROOT / "custom_nodes/raylight/src/raylight/distributed_modules/usp.py"
 
 
 def _module_symbols(path):
@@ -25,6 +30,21 @@ def _function(path, function_name, class_name=None):
     if class_name is not None:
         nodes = next(node.body for node in nodes if isinstance(node, ast.ClassDef) and node.name == class_name)
     return next(node for node in nodes if isinstance(node, ast.FunctionDef) and node.name == function_name)
+
+
+def _nested_function(path, function_name):
+    return next(node for node in ast.walk(ast.parse(path.read_text())) if isinstance(node, ast.FunctionDef) and node.name == function_name)
+
+
+def _call_name(call):
+    parts = []
+    node = call.func
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
 
 
 def _signature(function):
@@ -62,3 +82,106 @@ def test_minimax_usp_forward_signature_matches_core():
     assert _signature(_function(RAYLIGHT, "usp_dit_forward")) == _signature(
         _function(CORE, "_forward", "MiniMaxH3Model")
     )
+
+
+def test_minimax_usp_layout_and_mask_parity():
+    function = _function(RAYLIGHT, "usp_dit_forward")
+    packed_layout = next(node for node in ast.walk(function) if isinstance(node, ast.Call) and _call_name(node) == "PackedLayout")
+    source = ast.unparse(function)
+
+    assert all(keyword.arg != "frame_count" for keyword in packed_layout.keywords)
+    for name in ("cond_audio", "mask_row_values", "video_rows_t", "audio_rows_t", "rows_to_mod_index"):
+        assert name in source
+
+
+def test_minimax_usp_slices_per_row_modulation_with_sequence():
+    source = ast.unparse(_function(RAYLIGHT, "_split_packed_sequence"))
+
+    assert "isinstance(row, torch.Tensor)" in source
+    assert "segment_start - original_start" in source
+    assert "segment_end - original_start" in source
+
+
+def test_minimax_usp_attention_matches_core_kernels():
+    function = _function(RAYLIGHT, "usp_attn_forward")
+    calls = {_call_name(node) for node in ast.walk(function) if isinstance(node, ast.Call)}
+    attention_call = next(node for node in ast.walk(function) if isinstance(node, ast.Call) and _call_name(node) == "xfuser_optimized_attention")
+
+    assert "comfy.quant_ops.ck.rms_rope_split_half" in calls
+    assert "comfy.quant_ops.ck.rms_rope_split_half_" in calls
+    assert "v.clone" in calls
+    assert any(keyword.arg == "transformer_options" for keyword in attention_call.keywords)
+
+
+def test_minimax_lora_mlp_uses_module_forward():
+    function = _function(RAYLIGHT, "usp_mlp_forward")
+    calls = {_call_name(node) for node in ast.walk(function) if isinstance(node, ast.Call)}
+
+    assert "self.fc1" in calls
+    assert "torch.nn.functional.silu" in calls
+    assert "self.fc2" in calls
+
+
+def test_minimax_usp_routes_sidecar_fc2_lora():
+    function = _nested_function(USP, "_inject_minimax_h3")
+    source = ast.unparse(function)
+
+    assert "FSDP_LORA_SIDECAR_ATTACHMENT" in source
+    assert "diffusion_model.blocks." in source
+    assert "diffusion_model.token_refiner.blocks." in source
+    assert source.count("usp_mlp_forward") >= 2
+
+
+def test_minimax_usp_passes_pdd_schedule_to_final_layer():
+    function = _function(RAYLIGHT, "usp_dit_forward")
+    call = next(node for node in ast.walk(function) if isinstance(node, ast.Call) and _call_name(node) == "self.final_layer")
+
+    assert len(call.args) == 7
+    assert ast.unparse(call.args[4]) == "sigma_v"
+    assert ast.unparse(call.args[5]) == "transformer_options.get('sample_sigmas')"
+    assert ast.unparse(call.args[6]) == "(shift_v, shift_a)"
+
+
+def test_minimax_control_patch_uses_full_sequence_and_returns_local_shard():
+    function = _function(RAYLIGHT, "_run_control_patch")
+    module = ast.Module(body=[function], type_ignores=[])
+    control_inputs = []
+    control_outputs = []
+    full_input = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+    full_output = full_input + 10
+
+    class Group:
+        def __init__(self):
+            self.calls = 0
+
+        def all_gather(self, value, dim):
+            self.calls += 1
+            assert dim == 0
+            return torch.cat((full_input, torch.zeros(1, 2))) if self.calls == 1 else torch.cat((full_output, torch.zeros(1, 2)))
+
+    group = Group()
+    scope = {
+        "torch": torch,
+        "comfy": SimpleNamespace(model_prefetch=SimpleNamespace(pause_malloc_graph=nullcontext)),
+        "get_sp_group": lambda: group,
+        "get_sequence_parallel_world_size": lambda: 2,
+        "get_sequence_parallel_rank": lambda: 1,
+    }
+    exec(compile(module, str(RAYLIGHT), "exec"), scope)
+
+    control = SimpleNamespace(
+        before_block=lambda index, args: control_inputs.append((index, args["img"].clone(), args["layout"])),
+        after_block=lambda index, args, out: (control_outputs.append((index, out["img"].clone())) or {"img": out["img"] + 3}),
+    )
+    patch = SimpleNamespace(block_index=0, control_patch=control, previous=None)
+    layout = object()
+    local_input = torch.tensor([[6., 7.], [8., 9.], [0., 0.]])
+    args = {"img": local_input, "layout": layout}
+    result = scope["_run_control_patch"](patch, args, lambda data: {"img": data["img"] + 10}, 5)
+
+    assert group.calls == 2
+    assert control_inputs[0][0] == control_outputs[0][0] == 0
+    assert control_inputs[0][2] is layout
+    torch.testing.assert_close(control_inputs[0][1], full_input)
+    torch.testing.assert_close(control_outputs[0][1], full_output)
+    torch.testing.assert_close(result, torch.tensor([[19., 20.], [21., 22.], [0., 0.]]))

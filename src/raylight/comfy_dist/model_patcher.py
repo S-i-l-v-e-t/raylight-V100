@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import logging
 import gc
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,6 +19,7 @@ from comfy.model_patcher import get_key_weight, string_to_seed, move_weight_func
 
 from raylight import comfy_dist
 from .fsdp_utils import freeze_and_detect_qt, fully_shard_bottom_up, load_from_full_model_state_dict, materialize_excluded_params
+from .kitchen_distributed import temporary_sitepkg_ck_patches
 
 if TYPE_CHECKING:
     from raylight.distributed_worker.parallel_group_manager import XFuserParallelContext
@@ -232,6 +234,36 @@ def _collect_controlnet_shared_modules(diffusion_model: torch.nn.Module) -> set[
     return excluded
 
 
+def _expand_shape_changing_patches(model_patcher) -> None:
+    for key, patches in model_patcher.patches.items():
+        if not isinstance(key, str) or not key.endswith(".weight"):
+            continue
+
+        weight, _, _ = get_key_weight(model_patcher.model, key)
+        target_shape = comfy_dist.lora.calculate_shape(patches, weight, key)
+        if target_shape == weight.shape:
+            continue
+
+        state_weight = model_patcher.fsdp_state_dict.get(key)
+        if state_weight is None:
+            raise RuntimeError(f"Cannot expand shape-changing patch without FSDP state weight: {key}")
+
+        model_patcher.fsdp_state_dict[key] = comfy_dist.lora.pad_tensor_to_shape(state_weight, target_shape)
+        comfy.utils.set_attr_param(model_patcher.model, key, torch.empty(target_shape, dtype=weight.dtype, device=weight.device))
+
+        bias_key = f"{key[:-len('.weight')]}.bias"
+        module = comfy.utils.get_attr(model_patcher.model, key[:-len(".weight")])
+        bias = getattr(module, "bias", None)
+        if bias is None:
+            continue
+        state_bias = model_patcher.fsdp_state_dict.get(bias_key)
+        if state_bias is None:
+            raise RuntimeError(f"Cannot expand shape-changing patch without FSDP state bias: {bias_key}")
+        bias_shape = (target_shape[0], *bias.shape[1:])
+        model_patcher.fsdp_state_dict[bias_key] = comfy_dist.lora.pad_tensor_to_shape(state_bias, bias_shape)
+        comfy.utils.set_attr_param(model_patcher.model, bias_key, torch.empty(bias_shape, dtype=bias.dtype, device=bias.device))
+
+
 def patch_fsdp(self):
     print(f"[Rank {self.rank}] Applying FSDP to {type(self.model.diffusion_model).__name__}")
 
@@ -245,6 +277,7 @@ def patch_fsdp(self):
         raise ValueError("FSDP state_dict is None. Call set_fsdp_state_dict before patch_fsdp.")
 
     diffusion_model = self.model.diffusion_model
+    _expand_shape_changing_patches(self)
     fsdp_kwargs = {"reshard_after_forward": True}
     has_qt_runtime = freeze_and_detect_qt(diffusion_model)
     has_quant_sd = _state_dict_has_quant_payload(self.fsdp_state_dict)
@@ -273,38 +306,40 @@ def patch_fsdp(self):
         self.load_device if isinstance(self.load_device, torch.device) else torch.device("cuda", torch.cuda.current_device())
     )
 
-    if use_quant_loader:
-        load_from_full_model_state_dict(
-            model=self.model,
-            full_sd=self.fsdp_state_dict,
-            device=target_device,
-            strict=False,
-            cpu_offload=self.is_cpu_offload,
-            release_sd=False,
-        )
-    else:
-        options = StateDictOptions(
-            full_state_dict=True,
-            strict=False,
-            cpu_offload=self.is_cpu_offload,
-            broadcast_from_rank0=True,
-        )
-        set_model_state_dict(self.model, self.fsdp_state_dict, options=options)
+    patch_context = temporary_sitepkg_ck_patches() if use_quant_loader else nullcontext()
+    with patch_context:
+        if use_quant_loader:
+            load_from_full_model_state_dict(
+                model=self.model,
+                full_sd=self.fsdp_state_dict,
+                device=target_device,
+                strict=False,
+                cpu_offload=self.is_cpu_offload,
+                release_sd=True,
+            )
+        else:
+            options = StateDictOptions(
+                full_state_dict=True,
+                strict=False,
+                cpu_offload=self.is_cpu_offload,
+                broadcast_from_rank0=True,
+            )
+            set_model_state_dict(self.model, self.fsdp_state_dict, options=options)
 
-    # Materialize excluded params AFTER state dict loading so that
-    # set_model_state_dict only sees meta-device params (single device).
-    if excluded_modules:
-        count = materialize_excluded_params(
-            model=self.model,
-            excluded_modules=excluded_modules,
-            full_sd=self.fsdp_state_dict,
-            device=target_device,
-            cpu_offload=self.is_cpu_offload,
-        )
-        if count > 0:
-            print(f"[Rank {self.rank}] Materialized {count} excluded ControlNet-shared params on {target_device}")
+        # Materialize excluded params AFTER state dict loading so that
+        # set_model_state_dict only sees meta-device params (single device).
+        if excluded_modules:
+            count = materialize_excluded_params(
+                model=self.model,
+                excluded_modules=excluded_modules,
+                full_sd=self.fsdp_state_dict,
+                device=target_device,
+                cpu_offload=self.is_cpu_offload,
+            )
+            if count > 0:
+                print(f"[Rank {self.rank}] Materialized {count} excluded ControlNet-shared params on {target_device}")
 
-    _pre_init_fsdp(diffusion_model)
+        _pre_init_fsdp(diffusion_model)
     self.fsdp_state_dict = None
 
     print("FSDP registered successfully.")
@@ -323,6 +358,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         fsdp_state_dict: dict | None = None,
         device_mesh=None,
         is_cpu_offload: bool = False,
+        fast_disk=False,
     ):
         super().__init__(
             model=model,
@@ -330,6 +366,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
             offload_device=offload_device,
             size=size,
             weight_inplace_update=weight_inplace_update,
+            fast_disk=fast_disk,
         )
         self.rank = rank
         self.fsdp_state_dict = fsdp_state_dict
@@ -503,14 +540,14 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
                     m.bias_function = []
 
                 if weight_key in self.patches:
-                    if force_patch_weights:
+                    if force_patch_weights or comfy_dist.lora.calculate_shape(self.patches[weight_key], m.weight, weight_key) != m.weight.shape:
                         self.patch_weight_to_device(weight_key)
                     else:
                         _, set_func, convert_func = get_key_weight(self.model, weight_key)
                         m.weight_function = [LowVramPatch(weight_key, self.patches, convert_func, set_func)]
                         patch_counter += 1
                 if bias_key in self.patches:
-                    if force_patch_weights:
+                    if force_patch_weights or comfy_dist.lora.calculate_shape(self.patches[bias_key], m.bias, bias_key) != m.bias.shape:
                         self.patch_weight_to_device(bias_key)
                     else:
                         _, set_func, convert_func = get_key_weight(self.model, bias_key)
@@ -649,6 +686,7 @@ class PipefusionModelPatcher(comfy.model_patcher.ModelPatcher):
         pipefusion_config: "PipeFusionConfig | None" = None,
         stage_plan: "StagePlan | None" = None,
         parallel_context: "XFuserParallelContext | None" = None,
+        fast_disk=False,
     ):
         super().__init__(
             model=model,
@@ -656,6 +694,7 @@ class PipefusionModelPatcher(comfy.model_patcher.ModelPatcher):
             offload_device=offload_device,
             size=size,
             weight_inplace_update=weight_inplace_update,
+            fast_disk=fast_disk,
         )
         self.pipefusion_config = pipefusion_config
         self.pipefusion_stage = stage_plan
