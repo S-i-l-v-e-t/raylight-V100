@@ -81,7 +81,7 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}):
     q, k, v = self.qkv_proj(x_fp16).split(self.heads * self.head_dim, dim=-1)
     v = v.view(seq_len, self.heads, self.head_dim)
     if rope_freqs is not None:
-        # qkv_proj 权重被转成 fp16，而 q_norm/k_norm 权重仍是 fp32：norm 要在 fp32 下与 qw/kw 匹配
+        # V100 没有 BF16，norm 留在 fp32 里算，否则 MiniMax H3 音频会爆音
         q = q.to(torch.float32).view(1, seq_len, self.heads, self.head_dim)
         k = k.to(torch.float32).view(1, seq_len, self.heads, self.head_dim)
         qw = comfy.model_management.cast_to(self.q_norm.weight, device=x.device)
