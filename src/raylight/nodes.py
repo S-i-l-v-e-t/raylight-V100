@@ -1040,6 +1040,79 @@ class RayLoraLoader:
         return (loras_list,)
 
 
+class RayMiniMaxH3TurboLora:
+    """MiniMax-H3 Turbo LoRA for Ray workers.
+
+    Marks the LoRA dict so the worker's load_lora() routes it to the turbo
+    apply path (bypass by default, or merge with low_vram) instead of the
+    generic load_lora_for_models merge, which both misses the H3 key naming
+    and would fold the delta into the FP16-converted QKV weights.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "lora_name": (
+                    folder_paths.get_filename_list("loras"),
+                    {"tooltip": "The MiniMax-H3 Turbo LoRA."},
+                ),
+                "strength": (
+                    "FLOAT",
+                    {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01},
+                ),
+                "low_vram": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "label_on": "merge (low VRAM, softer)",
+                        "label_off": "bypass (sharp, more VRAM)",
+                        "tooltip": "OFF (default): apply the LoRA at run time (bypass). ON: merge into the weights — lower peak VRAM, softer on FP16/quantized bases.",
+                    },
+                ),
+            },
+            "optional": {"prev_ray_lora": ("RAY_LORA", {"default": None})},
+        }
+
+    RETURN_TYPES = ("RAY_LORA",)
+    FUNCTION = "load_lora"
+    CATEGORY = "Raylight"
+
+    def load_lora(self, lora_name, strength, low_vram=False, prev_ray_lora=None):
+        loras_list = []
+        if prev_ray_lora is not None:
+            loras_list.extend(prev_ray_lora)
+        if strength != 0.0:
+            loras_list.append({
+                "path": folder_paths.get_full_path_or_raise("loras", lora_name),
+                "strength_model": strength,
+                "minimax_h3_turbo": True,
+                "low_vram": bool(low_vram),
+            })
+        return (loras_list,)
+
+
+class RayMiniMaxH3TurboSampler:
+    """MiniMax-H3 Turbo 4-step sampler for Ray workers.
+
+    The SAMPLER object it returns holds _turbo_sampler from the importable
+    raylight module, so it survives Ray serialization to workers. Feed into
+    XFuserSamplerCustomAdvanced.sampler and set the scheduler to 4 steps.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    RETURN_TYPES = ("SAMPLER",)
+    FUNCTION = "get_sampler"
+    CATEGORY = "Raylight"
+
+    def get_sampler(self):
+        from raylight.diffusion_models.minimax.turbo_sampler import make_turbo_sampler
+        return (make_turbo_sampler(),)
+
+
 class XFuserKSamplerAdvanced:
     @classmethod
     def INPUT_TYPES(s):
@@ -1859,6 +1932,8 @@ NODE_CLASS_MAPPINGS = {
     "RayKill": RayKill,
     "RayUNETLoader": RayUNETLoader,
     "RayLoraLoader": RayLoraLoader,
+    "RayMiniMaxH3TurboLora": RayMiniMaxH3TurboLora,
+    "RayMiniMaxH3TurboSampler": RayMiniMaxH3TurboSampler,
     "RayControlNetLoader": RayControlNetLoader,
     "RayControlNetApply": RayControlNetApply,
     "RayVAELoader": RayVAELoader,
@@ -1879,6 +1954,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayKill": "Kill Ray",
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",
+    "RayMiniMaxH3TurboLora": "Load MiniMax-H3 Turbo LoRA (Ray)",
+    "RayMiniMaxH3TurboSampler": "MiniMax-H3 Turbo Sampler (Ray)",
     "RayControlNetLoader": "Load ControlNet (Ray)",
     "RayControlNetApply": "Apply ControlNet (Ray)",
     "RayVAELoader": "Load VAE (Ray)",

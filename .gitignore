@@ -112,3 +112,7 @@ yarn-error.log*
 node.zip
 .vscode/
 .claude/
+
+# local-only (V100 box)
+.tracking
+*.bak

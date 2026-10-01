@@ -194,12 +194,31 @@ def usp_attention_forward(
         key = key.repeat_interleave(self.heads // self.kv_heads, dim=1)
         value = value.repeat_interleave(self.heads // self.kv_heads, dim=1)
 
-    hidden_states = xfuser_optimized_attention(
-        query,
-        key,
-        value,
-        self.heads,
-        mask=None,
-        skip_reshape=True,
-    )
+    # OmniGen2 uses 21 attention heads, which cannot be split evenly across the
+    # Ulysses sequence-parallel group (heads % world != 0).  Fall back to a
+    # sequence-gathered attention: each rank holds a slice of the sequence, so
+    # gather the full K/V across ranks and attend locally for this rank's query
+    # slice.  Mathematically identical to single-GPU attention (query tokens are
+    # independent) and keeps both GPUs cooperating on one image at batch=1.
+    if self.heads % get_sequence_parallel_world_size() != 0:
+        key_full = get_sp_group().all_gather(key.contiguous(), dim=2)
+        value_full = get_sp_group().all_gather(value.contiguous(), dim=2)
+        hidden_states = torch.nn.functional.scaled_dot_product_attention(
+            query, key_full, value_full
+        )
+        # SDPA gives (bs, heads, seq_local, dim); to_out[0] (Linear over
+        # heads*dim) expects (bs, seq_local, heads*dim) - same layout the
+        # xfuser path produces via skip_output_reshape.
+        hidden_states = hidden_states.transpose(1, 2).reshape(
+            batch_size, -1, self.heads * self.dim_head
+        )
+    else:
+        hidden_states = xfuser_optimized_attention(
+            query,
+            key,
+            value,
+            self.heads,
+            mask=None,
+            skip_reshape=True,
+        )
     return self.to_out[0](hidden_states)

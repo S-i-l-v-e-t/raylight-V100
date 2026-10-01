@@ -34,6 +34,7 @@ from comfy_kitchen.tensor import (
 from .kitchen_patches.fp8 import install_fp8_patches, restore_fp8_patches
 from .kitchen_patches.int8 import install_int8_patches, restore_int8_patches
 from .kitchen_patches.nvfp4 import install_nvfp4_patches, restore_nvfp4_patches
+from .native_fp8 import install_native_fp8_collective_patch, restore_native_fp8_collective_patch
 
 
 _SITEPKG_LAYOUT_PATCHERS = {
@@ -78,11 +79,13 @@ def patch_enable_comfy_kitchen_fsdp(fn):
         layouts = self.parallel_dict.get("comfy_kitchen_layouts", ("fp8", "nvfp4", "int8"))
         if self.parallel_dict.get("is_fsdp", False):
             install_sitepkg_ck_patches(layouts=layouts)
+            install_native_fp8_collective_patch()
             patched = True
         try:
             return fn(self, *args, **kwargs)
         finally:
             if patched:
+                restore_native_fp8_collective_patch()
                 restore_sitepkg_ck_patches(layouts=layouts)
 
     return wrapper

@@ -19,15 +19,12 @@ class _RayTqdmCompat:
         self._bar = ray_tqdm(iterable, **_filter_ray_tqdm_kwargs(kwargs))
 
     def __iter__(self):
-        try:
-            yield from self._bar
-            return
-        except TypeError:
-            pass
-
         if self._iterable is None:
             return
 
+        # Iterate manually so update() goes through this wrapper (and any
+        # model_trange warmup override) instead of the worker-side tqdm's own
+        # __iter__, which would bypass it and never update the description.
         for item in self._iterable:
             yield item
             self.update(1)
@@ -80,10 +77,25 @@ class _RayTqdmCompat:
             return refresh()
 
     def close(self):
+        # Idempotent: __exit__ and __del__ can both run close() on the same
+        # bar. A second close would re-send a "closed" state the driver no
+        # longer has a bar for, resurrecting a ghost progress bar.
+        if getattr(self, "_closed", False):
+            return None
+        self._closed = True
         close = getattr(self._bar, "close", None)
         if close is None:
             return None
         return close()
+
+    def __del__(self):
+        # A `for i in trange(...)` loop never closes its bar explicitly, so
+        # release it on GC; otherwise the driver-side bar is never told it is
+        # closed and stays pinned on the terminal.
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def set_description(self, desc=None, refresh=True):
         set_description = getattr(self._bar, "set_description", None)
@@ -166,6 +178,8 @@ def patch_ray_tqdm(fn):
         rank = dist.get_rank()
         orig_tqdm = tqdm_auto.tqdm
         orig_trange = tqdm_auto.trange
+        orig_comfy_trange = None
+        orig_kdiff_tqdm = None
         if rank == 0:
             def ray_tqdm_absorb_disable(*a, **k):
                 return _RayTqdmCompat(*a, **k)
@@ -176,10 +190,26 @@ def patch_ray_tqdm(fn):
             tqdm_auto.tqdm = ray_tqdm_absorb_disable
             tqdm_auto.trange = ray_trange_absorb_disable
 
+            # The long-lived worker already imported comfy.utils and
+            # comfy.k_diffusion.sampling before this patch runs, so their
+            # module-level tqdm/trange bindings still point at plain tqdm.
+            # Swap them too so the main sampling loop (model_trange) and the
+            # rest of k_diffusion go through _RayTqdmCompat and get cleared on close.
+            import comfy.utils as comfy_utils
+            import comfy.k_diffusion.sampling as k_diffusion_sampling
+            orig_comfy_trange = comfy_utils.trange
+            orig_kdiff_tqdm = k_diffusion_sampling.tqdm
+            comfy_utils.trange = ray_trange_absorb_disable
+            k_diffusion_sampling.tqdm = ray_tqdm_absorb_disable
+
         try:
             return fn(*args, **kwargs)
         finally:
             tqdm_auto.tqdm = orig_tqdm
             tqdm_auto.trange = orig_trange
+            if orig_comfy_trange is not None:
+                comfy_utils.trange = orig_comfy_trange
+            if orig_kdiff_tqdm is not None:
+                k_diffusion_sampling.tqdm = orig_kdiff_tqdm
 
     return wrapper

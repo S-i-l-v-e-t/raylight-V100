@@ -76,7 +76,9 @@ def install_fp8_patches() -> None:
         if isinstance(scale, torch.Tensor):
             scale = scale.to(device=qdata.device)
 
-        return (qdata,), (scale,)
+        # NCCL has no FP8 collectives below sm90; ship raw bytes as uint8
+        # (same 1-byte size). post_all_gather reinterprets them back.
+        return (qdata.view(torch.uint8),), (scale,)
 
     @classmethod
     def post_all_gather(
@@ -90,6 +92,7 @@ def install_fp8_patches() -> None:
     ):
         (data,) = all_gather_outputs
         (scale,) = metadata
+        data = data.view(qtensor._qdata.dtype)
         orig_shape = tuple(qtensor._params.orig_shape)
 
         expected_numel = 1

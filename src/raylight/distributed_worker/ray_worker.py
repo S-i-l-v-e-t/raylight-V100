@@ -595,6 +595,16 @@ class RayWorker:
     def _patch_fsdp_for_sampling(self):
         try:
             self.model.patch_fsdp()
+            # patch_model is not called on the FSDP path, so object patches
+            # (e.g. the MiniMax H3 adaln forward injection) and injections
+            # (bypass LoRA hooks) would never be applied. FSDP wrapping
+            # replaces leaf-module forwards, so apply them only after wrap.
+            import comfy.utils as comfy_utils
+            for k in self.model.object_patches:
+                old = comfy_utils.set_attr(self.model.model, k, self.model.object_patches[k])
+                if k not in self.model.object_patches_backup:
+                    self.model.object_patches_backup[k] = old
+            self.model.inject_model()
         except Exception:
             self.active_request_key = None
             self.is_model_loaded = False
@@ -621,7 +631,11 @@ class RayWorker:
         if not lora_list:
             return ()
 
-        return tuple((lora["path"], float(lora["strength_model"])) for lora in lora_list)
+        return tuple(
+            (lora["path"], float(lora["strength_model"]),
+             bool(lora.get("minimax_h3_turbo", False)), bool(lora.get("low_vram", False)))
+            for lora in lora_list
+        )
 
     def _base_model_key(self, unet_path, model_options):
         return (unet_path, self._normalize_model_options(model_options))
@@ -1019,10 +1033,24 @@ class RayWorker:
         import comfy.sd as comfy_sd
         import comfy.utils as comfy_utils
 
+        from raylight.diffusion_models.minimax.turbo_lora import apply_turbo_lora
+
         for lora in self.lora_list:
             lora_path = lora["path"]
             strength_model = lora["strength_model"]
             lora_model = comfy_utils.load_torch_file(lora_path, safe_load=True)
+
+            if lora.get("minimax_h3_turbo"):
+                if self.parallel_dict["is_fsdp"] is True:
+                    print(f"[RayWorker {self.local_rank}] MiniMax H3 Turbo LoRA under FSDP "
+                          f"(mode={lora.get('low_vram') and 'merge' or 'bypass'})")
+                self.model = apply_turbo_lora(
+                    self.model, lora_model, strength_model,
+                    low_vram=lora.get("low_vram", False),
+                    fsdp=self.parallel_dict["is_fsdp"] is True,
+                )
+                del lora_model
+                continue
 
             if self.parallel_dict["is_fsdp"] is True:
                 from raylight.comfy_dist.sd import (
@@ -1073,6 +1101,16 @@ class RayWorker:
             print(f"VAE loaded in {self.global_world_size} GPUs")
         self.vae_model = vae_model
         self._cached_vae_path = vae_path
+
+    def ray_vae_encode(self, pixel_samples):
+        if self.vae_model is None:
+            raise RuntimeError("No VAE loaded on this Ray worker; connect RayVAELoader before using worker VAE encode")
+        return self.vae_model.encode(pixel_samples)
+
+    def ray_vae_decode(self, samples):
+        if self.vae_model is None:
+            raise RuntimeError("No VAE loaded on this Ray worker; connect RayVAELoader before using worker VAE decode")
+        return self.vae_model.decode(samples).cpu()
 
     @patch_ray_tqdm
     def ray_vae_decode_partial(self, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8, job_rank=0, job_world_size=1):

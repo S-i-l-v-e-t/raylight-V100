@@ -187,7 +187,11 @@ def install_fp8_patches() -> None:
         if isinstance(scale, torch.Tensor):
             scale = scale.to(device=qdata.device)
 
-        return (qdata,), (scale,)
+        # NCCL has no FP8 collectives below sm90, so ship the raw bytes as
+        # uint8 (same 1-byte size). torch's foreach_all_gather routes uint8
+        # inputs through a uint8 all-gather, and post_all_gather reinterprets
+        # them back to the storage dtype.
+        return (qdata.view(torch.uint8),), (scale,)
 
     def post_all_gather(
         qtensor: QuantizedTensor,
@@ -199,6 +203,9 @@ def install_fp8_patches() -> None:
     ):
         (data,) = all_gather_outputs
         (scale,) = metadata
+        # Gathered as uint8 in pre_all_gather; reinterpret the bytes as the
+        # original FP8 storage dtype.
+        data = data.view(qtensor._qdata.dtype)
         orig_shape = tuple(qtensor._params.orig_shape)
 
         expected_numel = 1
