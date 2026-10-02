@@ -206,21 +206,12 @@ def install_fp8_patches() -> None:
         # Gathered as uint8 in pre_all_gather; reinterpret the bytes as the
         # original FP8 storage dtype.
         data = data.view(qtensor._qdata.dtype)
-        orig_shape = tuple(qtensor._params.orig_shape)
-
-        expected_numel = 1
-        for dim in orig_shape:
-            expected_numel *= int(dim)
-
-        actual_numel = int(data.numel())
-        if actual_numel < expected_numel:
-            raise RuntimeError(
-                "FP8 FSDP post_all_gather produced insufficient storage for the upcoming "
-                "as_strided materialization. "
-                f"expected_numel={expected_numel}, actual_numel={actual_numel}, "
-                f"orig_shape={orig_shape}, gathered_shape={tuple(data.shape)}, "
-                f"dtype={data.dtype}, device={data.device}"
-            )
+        # The gathered payload is the whole weight. The sharded tensor's own
+        # orig_shape only covers this rank's dim-0 slice, so reusing it here
+        # leaves the unsharded tensor holding full data but reporting half the
+        # rows; anything materializing from .shape (cast/offload buffers,
+        # as_strided) then computes on a half width weight.
+        orig_shape = tuple(data.shape)
 
         if out is not None:
             if not isinstance(out, QuantizedTensor):
