@@ -1,5 +1,6 @@
 import torch
 import gc
+import math
 
 import comfy
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3FunControlBlockPatch
@@ -32,29 +33,6 @@ def _split_packed_sequence(h, rope_freqs, mod_segments):
     return h[start:end], rope_freqs[:, start:end], local_segments
 
 
-def _convert_qkv_to_fp16(module):
-    """递归转换所有 Attention 层的 QKV 权重为 FP16（原地）"""
-    if hasattr(module, 'qkv_proj') and hasattr(module.qkv_proj, 'weight'):
-        if module.qkv_proj.weight.dtype == torch.float32:
-            with torch.no_grad():
-                module.qkv_proj.weight.data = module.qkv_proj.weight.data.to(torch.float16)
-                print(f"[MiniMax FP16] Converted QKV weight to FP16 for {module.__class__.__name__}")
-    for child in module.children():
-        _convert_qkv_to_fp16(child)
-
-
-_original_model_init = None
-
-
-def patched_model_init(self, *args, **kwargs):
-    global _original_model_init
-    _original_model_init(self, *args, **kwargs)
-    _convert_qkv_to_fp16(self)
-    torch.cuda.empty_cache()
-    gc.collect()
-    print("[MiniMax FP16] QKV weights converted to FP16 immediately after loading.")
-
-
 def _run_control_patch(patch, args, block_wrap, full_size):
     local_size = args["img"].shape[0]
     with comfy.model_prefetch.pause_malloc_graph():
@@ -71,14 +49,24 @@ def _run_control_patch(patch, args, block_wrap, full_size):
         return result[start:start + local_size]
 
 
+def _fp16_scale(peak):
+    """把峰值 |t|∞ 压进 fp16 安全区的 2 的幂因子（已在范围内时为 1.0）。
+
+    fp16 只有 5 位指数，一个离群元素就能把它变成 inf；2 的幂在 fp16 里乘除是精确的，
+    所以缩放不引入舍入，只要在 fp16 范围内就原样（因子为 1）。
+    """
+    if not math.isfinite(peak) or peak <= 40000.0:
+        return 1.0
+    return 2.0 ** math.floor(math.log2(40000.0 / peak))
+
+
 def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}):
     if self.comfy_attention.function is not None:
         raise ValueError("Checkpoint-selected MiniMax H3 attention is not supported by Raylight USP")
     seq_len = x.shape[0]
     residual_dtype = x.dtype
 
-    x_fp16 = x.to(torch.float16)
-    q, k, v = self.qkv_proj(x_fp16).split(self.heads * self.head_dim, dim=-1)
+    q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
     v = v.view(seq_len, self.heads, self.head_dim)
     if rope_freqs is not None:
         # V100 没有 BF16，norm 留在 fp32 里算，否则 MiniMax H3 音频会爆音
@@ -99,6 +87,12 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}):
         q = self.q_norm(q.view(seq_len, self.heads, self.head_dim))
         k = self.k_norm(k.view(seq_len, self.heads, self.head_dim))
     v = v.clone()
+    # v 不过 norm，离群行会把原始量级带进 fp16 attention，而 fp16 只有 5 位指数。
+    # attention 会把不同 token 的 v 混在同一个加权和里，所以缩放必须是整张量同一个
+    # 2 的幂因子（逐 token 缩放会破坏这个线性关系）；softmax 权重不受影响，算完在
+    # fp32 里还原。
+    v_scale = _fp16_scale(float(v.abs().max()))
+    v = (v * v_scale).to(torch.float16)
     q = q.transpose(0, 1).unsqueeze(0)
     k = k.transpose(0, 1).unsqueeze(0)
     v = v.transpose(0, 1).unsqueeze(0)
@@ -107,7 +101,7 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}):
         q.to(torch.float16), k.to(torch.float16), v, self.heads, skip_reshape=True,
         transformer_options=transformer_options,
     )
-    out = out.to(residual_dtype)
+    out = (out.to(torch.float32) / v_scale).to(residual_dtype)
 
     # ====== 每个 block 都用全局 K/V 以 FP32 重算音频行（音频必须 FP32，否则爆音） ======
     audio_global_ranges = transformer_options.get('minimax_audio_global_ranges', [])
@@ -125,16 +119,16 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}):
         # 不能按"本 rank 是否有音频行"跳过；只有重算按本地音频行执行。
         # K 和 V 拼成一次 all_gather，减少集合点数量。
         kv = torch.cat([k.to(torch.float16).contiguous(),
-                        v.to(torch.float16).contiguous()], dim=-1)
+                        v.contiguous()], dim=-1)
         kv_global = get_sp_group().all_gather(kv, dim=2).to(torch.float32)
         k_global, v_global = torch.split(kv_global, self.head_dim, dim=-1)
         for ls, le in local_audio_ranges:
             out[:, ls:le] = attention_pytorch(
                 q[:, :, ls:le], k_global, v_global, self.heads, mask=None, skip_reshape=True
-            )
+            ) / v_scale
         del kv, kv_global
 
-    return self.out_proj(out.squeeze(0))
+    return self.out_proj(out.squeeze(0)).to(residual_dtype)
 
 
 def usp_mlp_forward(self, x):
@@ -324,6 +318,7 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
         else:
             h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
 
+
     if prefetch_queue is not None:
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
 
@@ -348,11 +343,3 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     audio_out = unpack_audio(a)
 
     return [-video_out.to(video_x.dtype), -audio_out.to(audio_x.dtype)]
-
-
-# ========== 在模型加载时安装补丁 ==========
-if not hasattr(comfy.ldm.minimax.model.MiniMaxH3Model, '_patched_by_raylight'):
-    _original_model_init = comfy.ldm.minimax.model.MiniMaxH3Model.__init__
-    comfy.ldm.minimax.model.MiniMaxH3Model.__init__ = patched_model_init
-    comfy.ldm.minimax.model.MiniMaxH3Model._patched_by_raylight = True
-    print("[MiniMax FP16] Patch installed: QKV weights will be converted to FP16 immediately after model load.")
