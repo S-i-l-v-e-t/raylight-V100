@@ -265,7 +265,10 @@ def apply_turbo_lora(model_patcher, lora, strength, low_vram=False, egrid_path=N
     if low_vram:
         n = _apply_merge_lora(new_model, lora, backbone, strength, fsdp=fsdp)
     else:
-        fc2_fused = set(_int8_fused_fc2(dm, backbone))
+        # FSDP/USP 下 MLP.forward 由 usp_mlp_forward 接管，BypassForwardHook 能正常
+        # 触发，fc2 不必再走 merge。merge 会设置 weight_function，而 cast_bias_weight
+        # 遇到 weight_function 会把量化权重反量化，等于把 fc2 踢出量化 GEMM。
+        fc2_fused = set() if fsdp else set(_int8_fused_fc2(dm, backbone))
         bypass_mods = [m for m in backbone if m not in fc2_fused]
         n = _apply_bypass_lora(new_model, lora, bypass_mods, strength)
         if fc2_fused:
