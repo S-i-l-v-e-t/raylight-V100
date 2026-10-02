@@ -1,3 +1,4 @@
+import torch
 import comfy_kitchen as ck
 from functools import wraps
 from comfy_kitchen.tensor import TensorCoreFP8Layout, TensorCoreNVFP4Layout
@@ -14,8 +15,20 @@ def _tensor_desc(tensor):
     return f"shape={tuple(shape) if shape is not None else None} device={device} dtype={dtype}"
 
 
+def _fallback_dequant_dtype(params, overwrite_cast_dtype):
+    # comfy sets orig_dtype to the dtype it is about to multiply in before it
+    # dequantizes, so that dtype is what the fallback GEMM wants. Honouring it
+    # skips a full size round trip through fp32. A dtype this device has no
+    # kernel for (bf16 on V100) still goes through the worker's overwrite dtype.
+    requested = getattr(params, "orig_dtype", None)
+    if requested in (torch.float16, torch.float32):
+        return requested
+    return overwrite_cast_dtype
+
+
 def dequantize_ray_temp_fix_fp8(qdata, params, dtype):
     global _FP8_FALLBACK_LOGGED
+    dtype = _fallback_dequant_dtype(params, dtype)
     if not _FP8_FALLBACK_LOGGED:
         print(f"[Raylight][comfy_kitchen][fp8] fallback dequantize dtype={dtype} qdata={_tensor_desc(qdata)}")
         _FP8_FALLBACK_LOGGED = True
@@ -24,6 +37,7 @@ def dequantize_ray_temp_fix_fp8(qdata, params, dtype):
 
 def dequantize_ray_temp_fix_nvfp4(qdata, params, dtype):
     global _NVFP4_FALLBACK_LOGGED
+    dtype = _fallback_dequant_dtype(params, dtype)
     if not _NVFP4_FALLBACK_LOGGED:
         print(f"[Raylight][comfy_kitchen][nvfp4] fallback dequantize dtype={dtype} qdata={_tensor_desc(qdata)}")
         _NVFP4_FALLBACK_LOGGED = True
