@@ -1264,8 +1264,10 @@ class RayWorker:
         self.ray_vae_loader(vae_path)
         decode_progress.check_cancel()
 
-    @ray.method(num_returns=2)
+    # @ray.method must stay innermost: Ray resolves method metadata through
+    # __wrapped__, and a wrapper carrying the attribute is not seen there.
     @patch_ray_tqdm
+    @ray.method(num_returns=2)
     def ray_vae_decode_partial(self, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8, job_rank=0, job_world_size=1):
         return ray_vae_decode_partial_impl(self, samples, tile_size, overlap, temporal_size, temporal_overlap, job_rank, job_world_size), None
 
@@ -1279,8 +1281,8 @@ class RayWorker:
     def ray_vae_decode_native(self, samples):
         return ray_vae_decode_native_impl(self, samples)
 
-    @ray.method(num_returns=2)
     @patch_ray_tqdm
+    @ray.method(num_returns=2)
     def ray_vae_decode_temporal_partial(self, samples, job_rank=0, job_world_size=1):
         return ray_vae_decode_temporal_partial_impl(self, samples, job_rank, job_world_size), None
 
@@ -1290,8 +1292,8 @@ class RayWorker:
     def ray_vae_decode_finalize(self, decoded):
         return ray_vae_decode_finalize_impl(self, decoded)
 
-    @ray.method(num_returns=2)
     @patch_ray_tqdm
+    @ray.method(num_returns=2)
     def ray_seedvr2_vae_decode_partial(self, samples, tile_size, overlap=64, job_rank=0, job_world_size=1):
         return ray_seedvr2_vae_decode_partial_impl(self, samples, tile_size, overlap, job_rank, job_world_size), None
 
