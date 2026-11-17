@@ -1,4 +1,7 @@
+import collections
+import time
 import gc
+import logging
 import ray
 
 import torch
@@ -8,7 +11,10 @@ import comfy.sample
 from comfy.k_diffusion import sa_solver
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
 import comfy.utils
-from .ray_patch_decorator import ray_patch_with_return
+import comfy.model_management
+from raylight.distributed_worker.ray_worker import retire_actors
+from raylight import progress
+from .ray_patch_decorator import prepare_ray_model, ray_patch_with_return
 
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
 
@@ -33,8 +39,9 @@ def _normalize_grouped_guiders(guiders: list, expected_length: int):
         if ray_actors is None:
             ray_actors = current_ray_actors
             continue
-        if current_ray_actors is not ray_actors and current_ray_actors != ray_actors:
-            raise ValueError("All RAY_GUIDER inputs must be created from the same ray actor set")
+        if (current_ray_actors["workers"] != ray_actors["workers"]
+                or current_ray_actors.get("model_request") != ray_actors.get("model_request")):
+            raise ValueError("All RAY_GUIDER inputs must use the same ray actor set and loaded model")
     return guiders, ray_actors
 
 
@@ -74,15 +81,62 @@ def _collect_grouped_results(results: list, expected_length: int, label: str):
     return [grouped_results[dp_rank] for dp_rank in range(expected_length)]
 
 
-def _clear_ray_worker_vram_after_sampling(ray_actors):
+def _retire_actors_after_fatal(ray_actors, exc):
+    """Kill workers whose state a failure has made unusable.
+
+    Freeing VRAM is not enough after an out of memory: aimdo is left unable to
+    allocate and the next sample raises "aimdo memory compile error" from a
+    worker that otherwise looks healthy. Killing them makes ensure_fresh_actors
+    respawn on the next run, which is the existing recovery path for a dead
+    actor.
+
+    Only for failures that indicate broken device state; an ordinary error does
+    not justify paying for a respawn.
+    """
+    blob = str(exc).lower()
+    if not any(k in blob for k in ("out of memory", "outofmemory", "aimdo", "cuda error",
+                                   "illegal memory access")):
+        return
+    retire_actors(ray_actors, "a fatal sampling error")
+
+
+def _clear_ray_worker_vram_after_sampling(ray_actors, force=False):
+    """Release worker VRAM once sampling is done.
+
+    `force` is for the failure path. A sampler that raises, most often on OOM,
+    leaves its allocations behind, and the next run inherits a card that is
+    already full. That is worth clearing whether or not the workflow asked for
+    routine cleanup.
+    """
     gpu_actors = ray_actors["workers"]
     if not gpu_actors:
         return
-    parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
-    if not parallel_dict.get("clear_vram_after_sampling", False):
-        return
+    if not force:
+        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+        if not parallel_dict.get("clear_vram_after_sampling", False):
+            return
 
-    ray.get([actor.clear_sampling_vram.remote() for actor in gpu_actors])
+    refs = [actor.clear_sampling_vram.remote() for actor in gpu_actors]
+    if force:
+        #After a failure a worker may be dead, retired, or stuck on one that is:
+        #clear whoever answers, and leave the original error to be the one raised.
+        try:
+            ray.get(refs, timeout=CANCEL_DRAIN_DEFAULT_SECONDS)
+        except Exception as error:
+            logging.warning("[Raylight] could not clear every worker after a failure: %s", error)
+    else:
+        ray.get(refs)
+    gc.collect()
+    comfy.model_management.unload_all_models()
+    comfy.model_management.soft_empty_cache()
+
+
+def _free_host_models_if_contended(ray_actors):
+    """Keep host models when GPU_SELECT excludes the host's CUDA device."""
+    selected = ray.get(ray_actors["workers"][0].get_parallel_dict.remote()).get("selected_gpus")
+    host_device = comfy.model_management.get_torch_device()
+    if selected is not None and host_device.type == "cuda" and host_device.index is not None and host_device.index not in selected:
+        return
     gc.collect()
     comfy.model_management.unload_all_models()
     comfy.model_management.soft_empty_cache()
@@ -99,22 +153,21 @@ def _validate_unified_parallel_setup(parallel_dict: dict, group_infos: list[dict
     ulysses_degree = _normalized_degree(parallel_dict.get("ulysses_degree"))
     ring_degree = _normalized_degree(parallel_dict.get("ring_degree"))
     cfg_degree = _normalized_degree(parallel_dict.get("cfg_degree"))
-    pp_degree = _normalized_degree(parallel_dict.get("pp_degree"))
     dp_degree = max(int(info.get("dp_degree", 1)) for info in group_infos) if group_infos else 1
-    effective_parallel_size = ulysses_degree * ring_degree * cfg_degree * pp_degree * dp_degree
+    effective_parallel_size = ulysses_degree * ring_degree * cfg_degree * dp_degree
 
     if effective_parallel_size <= 1:
         raise ValueError(
             f"{label} requires an active unified parallel topology with effective degree > 1. "
-            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, pp={pp_degree}, dp={dp_degree}. "
+            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, dp={dp_degree}. "
             "Use DPSamplerCustom for pure DP or single-worker execution."
         )
 
-    if not parallel_dict.get("is_xdit") and not parallel_dict.get("pipefusion_enabled"):
+    if not parallel_dict.get("is_xdit"):
         raise ValueError(
             f"{label} requires xFuser unified topology to be active. "
-            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, pp={pp_degree}, dp={dp_degree}, "
-            f"is_xdit={parallel_dict.get('is_xdit')}, pipefusion_enabled={parallel_dict.get('pipefusion_enabled')}. "
+            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, dp={dp_degree}, "
+            f"is_xdit={parallel_dict.get('is_xdit')}. "
             "DP-only execution should use DPSamplerCustom."
         )
 
@@ -412,6 +465,157 @@ class RayDualCFGGuider:
         )
 
 
+#A cancel is noticed at a checkpoint, so the time it should take to arrive is
+#one checkpoint interval - a property of the machine, not a constant, since one
+#block on a slow card can outlast any figure picked here. Measure the widest gap
+#seen between checkpoints during the run, which is what a worker is expected to
+#need, and allow a few times that. A worker is then only ended once it has
+#plainly stopped, not because the hardware was having a slow minute.
+CANCEL_DRAIN_CHECKPOINTS = 3
+#How many recent checkpoints the estimate is taken from. Recent, so a pause
+#early in the run - the first checkpoint follows the model load - does not set
+#the figure for everything after it. Their widest rather than their average: the
+#average understates the tail, and the tail is exactly the checkpoint that would
+#see a healthy worker ended for being slow.
+CANCEL_DRAIN_SAMPLES = 8
+CANCEL_DRAIN_MIN_SECONDS = 15.0
+CANCEL_DRAIN_MAX_SECONDS = 180.0
+#Used where there is no checkpoint signal to measure, such as a decode.
+CANCEL_DRAIN_DEFAULT_SECONDS = 60.0
+#Once one worker has answered, the cancel demonstrably works and the ranks run
+#in lockstep, so a peer that is going to answer will do so about a checkpoint
+#later. Waiting the whole window on it only delays a kill that is already due.
+CANCEL_PEER_MIN_SECONDS = 5.0
+
+
+def _drain(futures, slowest_checkpoint):
+    """Return the futures that never answered the cancel.
+
+    The full wait is only spent while nothing at all has answered. The moment one
+    worker does, the rest are given a short window instead: they are doing the
+    same work at the same time, so one still silent has stopped rather than
+    fallen behind.
+    """
+    grace = _drain_seconds(slowest_checkpoint)
+    answered, pending = ray.wait(futures, num_returns=1, timeout=grace)
+    if not answered:
+        return pending
+    peer = min(max(slowest_checkpoint, CANCEL_PEER_MIN_SECONDS), grace)
+    _more, stuck = ray.wait(pending, num_returns=len(pending), timeout=peer) if pending else ([], [])
+    return stuck
+
+
+def _drain_seconds(slowest_checkpoint):
+    if not slowest_checkpoint:
+        return CANCEL_DRAIN_DEFAULT_SECONDS
+    return min(max(slowest_checkpoint * CANCEL_DRAIN_CHECKPOINTS,
+                   CANCEL_DRAIN_MIN_SECONDS), CANCEL_DRAIN_MAX_SECONDS)
+
+
+def _first_failure(ready):
+    """Return the error of the first finished future that failed, if any."""
+    for ref in ready:
+        try:
+            ray.get(ref, timeout=0)
+        except Exception as error:
+            return error
+    return None
+
+
+def _fail_with_peers(failure, pending, ray_actors, slowest_checkpoint):
+    """Fail the job once a worker has failed, ending any peer it stranded.
+
+    The ranks share every collective, so the rest cannot finish without the one
+    that failed. Those that failed too - an OOM usually reaches every rank - have
+    unwound and stay usable. One still running a checkpoint later is waiting in a
+    collective on a peer that is gone, would hold its device forever, and can only
+    be ended.
+    """
+    if pending:
+        window = min(max(slowest_checkpoint, CANCEL_PEER_MIN_SECONDS), _drain_seconds(slowest_checkpoint))
+        _done, stuck = ray.wait(pending, num_returns=len(pending), timeout=window)
+        if stuck and ray_actors is not None:
+            retire_actors(ray_actors, "a worker failed and %d were left waiting on it" % len(stuck))
+    raise failure
+
+
+def _gather_with_progress(futures, ray_actors=None, *, independent=False, progress_reader=None):
+    """Wait on worker futures while relaying progress to the UI.
+
+    Poll instead of blocking in ray.get(), forwarding worker progress to a
+    host-side ProgressBar with the server's hook attached. Independent tasks
+    use cooperative cancellation without the sampling ranks' peer deadline.
+    """
+    pending = list(futures)
+    read_progress = progress.read if progress_reader is None else progress_reader
+    pbar = comfy.utils.ProgressBar(1)
+    last = None
+    last_preview_seq = -1
+    preview = None
+    checkpoints = collections.deque(maxlen=CANCEL_DRAIN_SAMPLES)
+    seen_at = None
+    try:
+        while pending:
+            _ready, pending = ray.wait(pending, num_returns=len(pending), timeout=0.5)
+            failure = _first_failure(_ready)
+            if failure is not None:
+                if independent:
+                    raise failure
+                _fail_with_peers(failure, pending, ray_actors, max(checkpoints) if checkpoints else 0.0)
+            #Checked every pass rather than only when the bar moves: a render that
+            #has stopped publishing progress is exactly the one worth cancelling.
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            current = read_progress()
+            if current is not None and current != last:
+                now = time.monotonic()
+                #The gap before the first checkpoint covers loading the model, so
+                #it says nothing about how quickly one arrives after another.
+                if seen_at is not None:
+                    checkpoints.append(now - seen_at)
+                seen_at = now
+                last = current
+                value, total, preview_seq = current
+                if not independent and preview_seq != last_preview_seq:
+                    last_preview_seq = preview_seq
+                    image = progress.read_preview()
+                    preview = ("JPEG", image, 512) if image is not None else None
+                pbar.update_absolute(min(value, total), total, preview)
+        return ray.get(futures)
+    except Exception as error:
+        if independent:
+            progress.request_cancel()
+            # Independent tasks can be at different chunk boundaries. One reply
+            # does not shorten the grace period for the other workers.
+            grace = max(CANCEL_DRAIN_DEFAULT_SECONDS, _drain_seconds(max(checkpoints) if checkpoints else 0.0))
+            try:
+                _done, stuck = ray.wait(futures, num_returns=len(futures), timeout=grace)
+            except ray.exceptions.RayError:
+                stuck = futures
+            if stuck and ray_actors is not None:
+                retire_actors(ray_actors, "%d decode task(s) did not stop" % len(stuck))
+            raise
+        if not isinstance(error, comfy.model_management.InterruptProcessingException):
+            raise
+        #Leaving now only stops the host waiting; the workers would sample to the
+        #end on a result nobody reads, holding the devices for the whole render.
+        progress.request_cancel()
+        #A cancel is cooperative: it is noticed at a block boundary, so it only
+        #reaches a worker that is still running. Whoever answers within the drain
+        #unwound properly and stays usable - comfy ends the allocation graph even
+        #when the forward leaves by exception, so the pool is still warm.
+        stuck = _drain(futures, max(checkpoints) if checkpoints else 0.0)
+        if stuck and ray_actors is not None:
+            #Whoever did not answer was not running to begin with. Nothing said
+            #over the side channel will reach it, so end it and let the loader
+            #respawn; otherwise it holds its devices until the server exits.
+            retire_actors(ray_actors, "%d worker(s) that did not answer a cancel"
+                          % len(stuck))
+        raise
+    finally:
+        if independent:
+            progress.reset_cancel()
+
+
 class XFuserSamplerCustomAdvanced:
     @classmethod
     def INPUT_TYPES(s):
@@ -440,11 +644,11 @@ class XFuserSamplerCustomAdvanced:
     CATEGORY = "Raylight/extra/custom_sampling/samplers"
 
     def ray_sample(self, add_noise, noise_seed, guider, sampler, sigmas, latent_image):
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
         ray_actors = _extract_ray_actors_from_guider(guider)
+        ray_actors = prepare_ray_model(ray_actors)
+        _free_host_models_if_contended(ray_actors)
         gpu_actors = ray_actors["workers"]
+        progress.reset_cancel()
         futures = [
             actor.custom_sampler_advanced.remote(
                 add_noise,
@@ -453,10 +657,16 @@ class XFuserSamplerCustomAdvanced:
                 sampler,
                 sigmas,
                 latent_image,
+                sampling_patches=ray_actors.get("sampling_patches", ()),
             )
             for actor in gpu_actors
         ]
-        results = ray.get(futures)
+        try:
+            results = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         output, denoised_output = results[0]
         return (output, denoised_output, ray_actors)
@@ -515,10 +725,10 @@ class XFuserSamplerCustom:
         sigmas,
         latent_image,
     ):
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
+        ray_actors = prepare_ray_model(ray_actors)
+        _free_host_models_if_contended(ray_actors)
         gpu_actors = ray_actors["workers"]
+        progress.reset_cancel()
         futures = [
             actor.custom_sampler.remote(
                 add_noise,
@@ -529,10 +739,16 @@ class XFuserSamplerCustom:
                 sampler,
                 sigmas,
                 latent_image,
+                sampling_patches=ray_actors.get("sampling_patches", ()),
             )
             for actor in gpu_actors
         ]
-        results = ray.get(futures)
+        try:
+            results = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         out = results[0]
         return (out, ray_actors)
@@ -564,11 +780,8 @@ class UnifiedParallelSamplerCustomAdvanced:
         sampler = sampler[0]
         sigmas = sigmas[0]
 
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
-
-        initial_ray_actors = _extract_ray_actors_from_guider(guider[0])
+        initial_ray_actors = prepare_ray_model(_extract_ray_actors_from_guider(guider[0]))
+        _free_host_models_if_contended(initial_ray_actors)
         gpu_actors = initial_ray_actors["workers"]
         parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
         group_infos = ray.get([actor.get_exec_group_info.remote() for actor in gpu_actors])
@@ -577,8 +790,10 @@ class UnifiedParallelSamplerCustomAdvanced:
 
         noise_list = _normalize_grouped_inputs(noise_list, dp_degree, "noise_list")
         guider, ray_actors = _normalize_grouped_guiders(guider, dp_degree)
+        ray_actors = initial_ray_actors
         latent_image = _normalize_grouped_inputs(latent_image, dp_degree, "latent_image")
 
+        progress.reset_cancel()
         futures = [
             actor.custom_sampler_advanced.remote(
                 add_noise,
@@ -588,10 +803,16 @@ class UnifiedParallelSamplerCustomAdvanced:
                 sigmas,
                 latent_image[group_info["dp_rank"]],
                 grouped_output=True,
+                sampling_patches=_extract_ray_actors_from_guider(guider[group_info["dp_rank"]]).get("sampling_patches", ()),
             )
             for actor, group_info in zip(gpu_actors, group_infos)
         ]
-        results = ray.get(futures)
+        try:
+            results = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         results = _collect_grouped_results(results, dp_degree, "Unified Parallel SamplerCustomAdvanced")
         outputs, denoised_outputs = _split_advanced_results(results)
@@ -646,14 +867,13 @@ class UnifiedParallelSamplerCustom:
         latent_image,
     ):
         ray_actors = ray_actors[0]
+        ray_actors = prepare_ray_model(ray_actors)
         add_noise = add_noise[0]
         cfg = cfg[0]
         sampler = sampler[0]
         sigmas = sigmas[0]
 
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
+        _free_host_models_if_contended(ray_actors)
         gpu_actors = ray_actors["workers"]
         parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
         group_infos = ray.get([actor.get_exec_group_info.remote() for actor in gpu_actors])
@@ -664,6 +884,7 @@ class UnifiedParallelSamplerCustom:
         negative = _normalize_grouped_inputs(negative, dp_degree, "negative")
         latent_image = _normalize_grouped_inputs(latent_image, dp_degree, "latent_image")
 
+        progress.reset_cancel()
         futures = [
             actor.custom_sampler.remote(
                 add_noise,
@@ -675,10 +896,16 @@ class UnifiedParallelSamplerCustom:
                 sigmas,
                 latent_image[group_info["dp_rank"]],
                 grouped_output=True,
+                sampling_patches=ray_actors.get("sampling_patches", ()),
             )
             for actor, group_info in zip(gpu_actors, group_infos)
         ]
-        results = ray.get(futures)
+        try:
+            results = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         out = _collect_grouped_results(results, dp_degree, "Unified Parallel SamplerCustom")
         return (out, ray_actors)
@@ -710,18 +937,17 @@ class DPSamplerCustomAdvanced:
         sampler = sampler[0]
         sigmas = sigmas[0]
 
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
-
-        initial_ray_actors = _extract_ray_actors_from_guider(guider[0])
+        initial_ray_actors = prepare_ray_model(_extract_ray_actors_from_guider(guider[0]))
+        _free_host_models_if_contended(initial_ray_actors)
         gpu_actors = initial_ray_actors["workers"]
         num_gpus = len(gpu_actors)
 
         guider, ray_actors = _normalize_grouped_guiders(guider, num_gpus)
+        ray_actors = initial_ray_actors
         latent_image = _normalize_grouped_inputs(latent_image, num_gpus, "latent_image")
         noise_list = _normalize_grouped_inputs(noise_list, num_gpus, "noise_list")
 
+        progress.reset_cancel()
         futures = [
             actor.custom_sampler_advanced.remote(
                 add_noise,
@@ -730,10 +956,16 @@ class DPSamplerCustomAdvanced:
                 sampler,
                 sigmas,
                 latent_image[i],
+                sampling_patches=_extract_ray_actors_from_guider(guider[i]).get("sampling_patches", ()),
             )
             for i, actor in enumerate(gpu_actors)
         ]
-        results = ray.get(futures)
+        try:
+            results = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         outputs, denoised_outputs = _split_advanced_results(results)
         return (outputs, denoised_outputs, ray_actors)
@@ -785,14 +1017,13 @@ class DPSamplerCustom:
         latent_image,
     ):
         ray_actors = ray_actors[0]
+        ray_actors = prepare_ray_model(ray_actors)
         add_noise = add_noise[0]
         cfg = cfg[0]
         sampler = sampler[0]
         sigmas = sigmas[0]
 
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
+        _free_host_models_if_contended(ray_actors)
         gpu_actors = ray_actors["workers"]
         num_gpus = len(gpu_actors)
         # Replicate last item to fill remaining slots, or truncate if too many
@@ -810,6 +1041,7 @@ class DPSamplerCustom:
             noise_list = noise_list[:num_gpus]
 
         # Each GPU gets its own noise/conditioning/latent — decoupled from FSDP sharding
+        progress.reset_cancel()
         futures = [
             actor.custom_sampler.remote(
                 add_noise,
@@ -820,10 +1052,16 @@ class DPSamplerCustom:
                 sampler,
                 sigmas,
                 latent_image[i],
+                sampling_patches=ray_actors.get("sampling_patches", ()),
             )
             for i, actor in enumerate(gpu_actors)
         ]
-        out = ray.get(futures)
+        try:
+            out = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         return (out, ray_actors)
 

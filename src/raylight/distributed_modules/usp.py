@@ -1,5 +1,6 @@
 import types
 from comfy import model_base
+from comfy.ldm.modules.attention import ComfyAttention
 
 
 class USPInjectRegistry:
@@ -332,6 +333,20 @@ if hasattr(model_base, "ChromaRadiance"):
         model.forward_orig = types.MethodType(usp_dit_forward, model)
 
 
+if hasattr(model_base, "Flux3"):
+
+    @USPInjectRegistry.register(model_base.Flux3)
+    def _inject_flux3(model_patcher, base_model, *args):
+        from ..diffusion_models.flux3.xdit_context_parallel import usp_block_forward, usp_flux3_forward
+
+        model = base_model.diffusion_model
+        blocks = list(model.content_mode_blocks["image"]) + list(model.single_blocks)
+        model.raylight_native_attention = any(block.comfy_attention.function is not None for block in blocks)
+        for block in blocks:
+            block.forward = types.MethodType(usp_block_forward, block)
+        model._forward = types.MethodType(usp_flux3_forward, model)
+
+
 if hasattr(model_base, "Flux"):
 
     @USPInjectRegistry.register(model_base.Flux)
@@ -409,17 +424,40 @@ if hasattr(model_base, "MiniMaxH3"):
 
     @USPInjectRegistry.register(model_base.MiniMaxH3)
     def _inject_minimax_h3(model_patcher, base_model, *args):
-        from ..diffusion_models.minimax.xdit_context_parallel import (
-            usp_attn_forward, usp_dit_forward, usp_mlp_forward,
-        )
+        from ..comfy_dist.model_patcher import FSDPModelPatcher
+        from ..comfy_dist.sd import FSDP_LORA_SIDECAR_ATTACHMENT
+        from ..diffusion_models.minimax.xdit_context_parallel import usp_attn_forward, usp_block_forward, usp_dit_forward, usp_mlp_forward
 
         model = base_model.diffusion_model
-        # MLP.forward 必须替换：ComfyUI 的 linear_input_act 直接拿 linear.weight 调
-        # 量化 kernel，会绕过模块 forward，使 BypassForwardHook 无法触发。
+        sidecar_groups = model_patcher.get_attachment(FSDP_LORA_SIDECAR_ATTACHMENT) or {}
+        options = model_patcher.get_attachment("raylight_model_options").minimax
+        attention_fp16 = options.attention_fp16
+        mlp_fp16 = options.mlp_fp16
+        fp32_residual = options.fp32_residual
+        chunk = options.mlp_chunk_tokens
+        model.raylight_fp32_residual = fp32_residual
         for block in model.blocks:
+            for attention in block.attn.modules():
+                if isinstance(attention, ComfyAttention) and attention.function is not None:
+                    raise ValueError("Checkpoint-selected MiniMax H3 attention is not supported by Raylight USP")
+        # MLP.forward 必须无条件替换：ComfyUI 的 linear_input_act 直接拿 linear.weight 调
+        # 量化 kernel，会绕过模块 forward，挂在 fc2 上的 BypassForwardHook 就永远不会触发，
+        # turbo LoRA 的 delta 只能退化成 merge。替换后 _mlp_branch 仍走融合路径，不减性能。
+        unfused_mlp = isinstance(model_patcher, FSDPModelPatcher)
+        for i, block in enumerate(model.blocks):
             block.attn.forward = types.MethodType(usp_attn_forward, block.attn)
+            if attention_fp16 or mlp_fp16 or fp32_residual:
+                block.raylight_attention_fp16 = attention_fp16
+                block.raylight_mlp_fp16 = mlp_fp16
+                block.forward = types.MethodType(usp_block_forward, block)
+            sidecar = f"diffusion_model.blocks.{i}.mlp.fc2" in sidecar_groups
+            block.mlp.raylight_chunk_tokens = chunk
+            block.mlp.raylight_unfused_mlp = sidecar or unfused_mlp
             block.mlp.forward = types.MethodType(usp_mlp_forward, block.mlp)
-        for block in model.token_refiner.blocks:
+        for i, block in enumerate(model.token_refiner.blocks):
+            sidecar = f"diffusion_model.token_refiner.blocks.{i}.mlp.fc2" in sidecar_groups
+            block.mlp.raylight_chunk_tokens = 0
+            block.mlp.raylight_unfused_mlp = sidecar or unfused_mlp
             block.mlp.forward = types.MethodType(usp_mlp_forward, block.mlp)
         model._forward = types.MethodType(usp_dit_forward, model)
 

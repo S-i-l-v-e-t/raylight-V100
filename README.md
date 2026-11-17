@@ -9,6 +9,22 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 <details><summary><strong>Click to expand changelog</strong></summary>
 
+- FLUX.3 USP: Add dedicated sequence parallelism with native block operations, reference-image handling, and CFG integration.
+- MiniMax H3 optimization: Add FP16 attention/MLP, FP32 residuals, token chunking, and local embedding/output-head computation. (credit: Kanislo)
+- MiniMax Fun ControlNet: Add Raylight integration with correct full-sequence control metadata. (credit: Kanislo)
+- Temporal VAE decoding: Distribute stock H3 temporal chunks across workers; retain native decoding for stills and Sol-H3-VAE. (credit: Kanislo)
+- Decode progress and cancellation: Add progress, cooperative cancellation, failure detection, and cleanup across distributed decode stages. (credit: Kanislo)
+- Sampler progress and previews: Relay worker progress/previews to ComfyUI and fix black video previews. (credit: Kanislo)
+- Worker recovery: Improve cancellation, dead-worker detection, actor recovery, and process teardown. (credit: Kanislo)
+- FSDP memory fixes: Improve CPU offloading, quantized shard cleanup, checkpoint lifetimes, and native cleanup integration. (credit: Kanislo)
+- Quantized loading: Default to sequential loading for lower peak RAM; add opt-in parallel loading. (credit: Kanislo)
+- Experimental MXFP8: Add FSDP gathering and reconstruction support for MXFP8 weights and scales.
+- Attention improvements: Add Kitchen INT8 attention (ring_degree=1), nested patch-scope fixes, and ring-attention LSE correction. (credit: Kanislo)
+- NUMA placement: Add optional GPU-local CPU affinity and preferred host-memory placement, disabled by default. (credit: Kanislo)
+- Worker controls: Add VRAM budgets, collective timeouts, selectable pinned memory, and Kill Ray (from Init). (credit: Kanislo)
+- Workflow caching: Fix stale model, LoRA, and patch state when switching cached branches; restore required ControlNet/VAE resources.
+- Configuration: Introduce immutable, typed RaylightConfig shared by worker startup and recovery.
+- Breaking change: Remove PipeFusion nodes and runtime paths; affected workflows require migration.
 - Prevent materialized view FSDP using direct DTensor class instead of sugarcoated PyTorch handler thanks to https://github.com/StanLukuvka for insight.
 - **BETA** Qwen 2.1 Image USP.
 - Fix bug with PDD Lora Minimax.
@@ -149,6 +165,9 @@ Its job is to split the model weights among GPUs.
   export RAYLIGHT_KEEP_CUDA_MALLOC_ASYNC=1
   ```
   Other allocator options, such as `expandable_segments:True`, are preserved.
+- Quantized FSDP models load one worker at a time by default to limit peak host RAM.
+  Enable `parallel_quant_load` on Ray Initializer Advanced to load workers
+  concurrently. This can reduce loading time but increase peak host RAM usage.
 - Example WF just open from your comfyui menu and browse templates
 - **GPU Topology** is very important, not all PCIe in your motherboard is equal.
 - VRAM leakage, when using [Ring > 1 instead of Ulysses](https://github.com/feifeibear/long-context-attention/issues/112).
@@ -255,6 +274,7 @@ This is experimental mode where all type of parallel group can work at a sime ti
 | Flux Kontext      | ✅  | ✅   | ❌  |
 | Flux Krea         | ✅  | ✅   | ❌  |
 | Flux 2            | ✅  | ✅   | ❌  |
+| Flux 3 Klein      | ✅  | ✅   | ❌  |
 | Flux ControlNet   | ✅  | ✅   | ❌  |
 
 

@@ -29,31 +29,71 @@ graph TB
     style D fill:#e8f5e9
 ```
 
-**Note**: PipeFusion code exists in the WAN implementation but is not used in Raylight.
-
 ## Quick Start
 
 ### Basic Configuration
 
 ```python
-parallel_dict = {
-    # FSDP (optional)
-    "is_fsdp": False,
-    "fsdp_cpu_offload": False,
+from raylight.distributed_worker.raylightworker_config_schema import (
+    RaylightConfig, RayWorkerConfig, XFuserParallelConfig,
+)
 
-    # USP/CFG (optional)
-    "is_xdit": True,
-    "ulysses_degree": 4,
-    "ring_degree": 1,
-    "cfg_degree": 2,
-
-    # PipeFusion (optional, currently soft disabled)
-    "pipefusion_enabled": False,
-
-    # Other
-    "use_mmap": True,
-}
+config = RaylightConfig(worker=RayWorkerConfig(
+    parallel=XFuserParallelConfig(
+        enabled=True, ulysses_degree=4, ring_degree=1, cfg_degree=2,
+    ),
+    fsdp_enabled=False,
+    use_mmap=True,
+))
 ```
+
+Ray Init builds an immutable configuration and passes its worker section to actors.
+Model-family settings live under `config.worker.model_options`; loaded-model facts
+and resolved ranks remain worker state. The legacy parallel dictionary returned to
+sampler nodes is a derived view, not a second configuration store.
+
+Advanced Ray Init exposes worker VRAM headroom/reserve, pinned memory, quantized-load
+concurrency, collective timeout, and `numa_bind` (off by default). When enabled on a
+supported Linux host, each worker pins its CPU affinity to the NUMA node its GPU is
+attached to, intersected with any inherited affinity restriction, and requests
+preferred host-memory placement when libnuma is available, without strict binding.
+MiniMax precision/chunking comes from
+**RayWorker Minimax Option**. **COMFY_KITCHEN_INT8** is selected through the existing
+attention backend input and currently requires `ring_degree=1`.
+
+Model patches travel with the graph's actor bundle and are applied to a temporary
+model patcher for each sampler or model-dependent getter call. Cached branches can
+change, bypass, or revert patches without retaining another branch's settings or
+restarting Ray Init. Consumers reselect the requested model, loader options, and
+LoRAs before use; matching workers reuse their loaded model. ControlNet conditioning
+also retains its ControlNet and VAE paths for worker-side restoration.
+
+### FLUX.3 parallelism
+
+FLUX.3 USP distributes the image-only and joint block sequences, preserving native
+reference/text preprocessing, modulation spans, RoPE, and fused block operations.
+Sequences divisible by the worker count use xFuser attention; other lengths gather
+valid keys/values for native attention without including padding in the softmax.
+Checkpoint-selected or externally overridden attention retains native execution.
+CFG parallelism splits raw references as well as preprocessed conditioning.
+
+### Distributed VAE decoding
+
+**Distributed VAE (Ray)** automatically spreads stock MiniMax H3 video decoding
+across workers using the VAE's native temporal chunks and overlap. Only assigned
+latent chunks move to each GPU, and worker 0 combines decoded chunks. H3 stills
+and Sol-H3-VAE use native decoding on worker 0. Other supported VAEs retain spatial
+tiling. H3 ignores the node's tile controls; `temporal_size` and `temporal_overlap`
+remain unused compatibility inputs. The existing clear-VRAM setting also releases
+cached worker VAEs after decoding.
+
+Distributed decoding reports progress for each worker's chunks or tiles, combining,
+and finalization, using fixed task shares so late-starting workers do not change the
+total. Cancellation is cooperative at these boundaries and before/after loading or
+native decoding; it cannot interrupt a running CUDA kernel. Workers that stop are
+reused after cleanup. Unresponsive tasks get a full grace period (60–180 seconds),
+then the worker group is retired and recreated on the next run. Decode failures
+also cancel peer work and force cleanup, independently of the clear-VRAM setting.
 
 ### GPU Requirements
 
@@ -97,7 +137,8 @@ custom_nodes/raylight/
 │   │   ├── cfg.py              # CFG registry
 │   │   └── attention.py        # xfuser attention factory
 │   ├── distributed_worker/
-│   │   └── ray_worker.py       # Ray worker implementation
+│   │   ├── ray_worker.py       # Ray worker implementation
+│   │   └── raylightworker_config_schema.py # Immutable configuration
 │   └── diffusion_models/
 │       ├── utils.py            # Padding utilities
 │       ├── flux/               # Flux model parallelism

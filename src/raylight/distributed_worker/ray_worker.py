@@ -3,36 +3,29 @@ import sys
 import gc
 import json
 import logging
+import contextlib
 import functools
+import socket
+import inspect
+import time
 from datetime import timedelta
 
+import psutil
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FSDPModule
 import ray
 
 import comfy.patcher_extension as pe
+from comfy import model_base, model_management
 
-from raylight.distributed_modules.pipefusion import (
-    PipeFusionInjectRegistry,
-    pipefusion_diffusion_model_wrapper,
-    pipefusion_outer_sample_wrapper,
-    pipefusion_predict_noise_wrapper,
-)
 from raylight.distributed_modules.usp import USPInjectRegistry
+from raylight.diffusion_models.minimax.fp16_support import minimax_precision_loading
 from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
-from raylight.distributed_worker.pipefusion_schema import (
-    PipeFusionConfig,
-    build_stage_plan,
-)
-from raylight.distributed_worker.pipefusion_state import (
-    PIPEFUSION_RUNTIME_ATTACHMENT,
-    PIPEFUSION_WRAPPER_KEY,
-    PipeFusionRuntime,
-)
+from raylight.distributed_worker.raylightworker_config_schema import RayWorkerConfig
 from raylight.distributed_worker.parallel_group_manager import (
+    collective_group_timeout,
     initialize_xfuser_parallel,
-    requires_xfuser_parallel,
 )
 from raylight.distributed_worker.ray_worker_controlnet import (
     _prepare_control_models,
@@ -40,13 +33,21 @@ from raylight.distributed_worker.ray_worker_controlnet import (
     _restore_controlnet_refs,
 )
 from raylight.distributed_worker.ray_worker_vae import (
+    combine_dist_vae_partials,
+    combine_seedvr2_vae_partials,
     load_vae_model,
     ray_vae_decode_finalize_impl,
+    ray_vae_decode_native_impl,
     ray_vae_decode_partial_impl,
+    ray_vae_decode_temporal_combine_impl,
+    ray_vae_decode_temporal_partial_impl,
     ray_seedvr2_vae_decode_partial_impl,
+    vae_decode_mode,
 )
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
+from raylight.numa import bind_to_gpu_node
+from raylight import decode_progress
 from ray.exceptions import RayActorError
 
 
@@ -59,9 +60,6 @@ _WORKER_AIMDO_INIT_ATTEMPTED = False
 
 # If ray actor function being called from outside, ray.get([task in actor task]) will become sync between rank
 # If called from ray actor within. dist.barrier() become the sync.
-
-# PIPEFUSION STUFF IS ONLY TESTING, IT IS BREAKING DOWN ALLLL THE TIME
-
 
 # Comfy cli args, does not get pass through into ray actor
 def patch_enable_comfy_kitchen_fsdp(fn):
@@ -88,13 +86,19 @@ def _apply_worker_comfy_cli_args_from_env():
 
     try:
         import comfy.cli_args
-        from comfy.cli_args import PerformanceFeature
+        from comfy.cli_args import LatentPreviewMethod, PerformanceFeature
     except Exception as exc:
         logging.warning(f"Failed to import Comfy modules for worker CLI arg sync: {exc}")
         return worker_cli_args
 
     if "fast" in worker_cli_args:
         worker_cli_args["fast"] = {PerformanceFeature(feature) for feature in worker_cli_args["fast"]}
+
+    if "preview_method" in worker_cli_args:
+        try:
+            worker_cli_args["preview_method"] = LatentPreviewMethod(worker_cli_args["preview_method"])
+        except ValueError:
+            worker_cli_args.pop("preview_method")
 
     comfy_args = comfy.cli_args.args
     for key, value in worker_cli_args.items():
@@ -373,8 +377,192 @@ def _build_ray_guider(model, guider_spec):
     return guider
 
 
+@contextlib.contextmanager
+def _progress_reporting(model, local_rank, total_steps=1):
+    """Publish sampler progress from rank 0 so the host can display it.
+
+    ComfyUI's ProgressBar reports through a global hook owned by the server,
+    which exists only in the host process, so a worker's updates go nowhere.
+    Rank 0 installs its own hook and writes to the progress side channel.
+    Per-block forward hooks fill the long gaps between sampler steps: with
+    four steps over fifty blocks the bar advances two hundred times, not four.
+    Blocks are found by walking the diffusion model for ModuleLists, so this
+    works for any architecture and degrades to step-only if none are found.
+    """
+    import comfy.model_management as comfy_model_management
+    import comfy.utils as comfy_utils
+    from raylight import progress
+
+    def _collect_blocks(module, depth=0):
+        """Top-most repeated ModuleLists, wherever the architecture puts them.
+
+        Some models expose blocks directly on the diffusion model, others nest
+        them a level or two down. Recurse until a ModuleList is found, then
+        stop: descending further would count a block's own sublayers.
+        """
+        found = []
+        for child in module.children():
+            if isinstance(child, torch.nn.ModuleList) and len(child) > 1:
+                found.extend(child)
+            elif depth < 3:
+                found.extend(_collect_blocks(child, depth + 1))
+        return found
+
+    root = getattr(getattr(model, "model", model), "diffusion_model", None)
+    blocks = _collect_blocks(root) if root is not None else []
+    n_blocks = max(len(blocks), 1)
+
+    def _stop_if_cancelled(force=False):
+        if progress.cancel_requested(force=force):
+            raise comfy_model_management.InterruptProcessingException()
+
+    _stop_if_cancelled(force=True)
+
+    #Every rank watches, not just the reporting one. A rank that leaves a
+    #collective alone strands its peers waiting on a member that is gone; all
+    #of them checking the same marker at the same block leaves together.
+    if local_rank != 0:
+        def on_block_cancel(_module, _args, _output):
+            _stop_if_cancelled()
+
+        handles = []
+        try:
+            for block in blocks:
+                try:
+                    handles.append(block.register_forward_hook(on_block_cancel))
+                except Exception:
+                    pass
+            yield
+        finally:
+            for handle in handles:
+                try:
+                    handle.remove()
+                except Exception:
+                    pass
+        return
+
+    state = {"step": 0, "steps": max(int(total_steps), 1), "seen": 0, "pseq": 0}
+    progress.clear()
+
+    def on_step(value, total, preview=None, **_kwargs):
+        # ComfyUI passes node_id as a keyword; accept whatever it sends.
+        _stop_if_cancelled()
+        state["step"] = int(value)
+        state["steps"] = max(int(total), 1)
+        state["seen"] = 0
+        if preview is not None:
+            try:
+                progress.write_preview(preview[1])
+                state["pseq"] += 1
+            except Exception:
+                pass
+        progress.write(state["step"] * n_blocks, state["steps"] * n_blocks,
+                       force=True, preview_seq=state["pseq"])
+
+    def on_block(_module, _args, _output):
+        state["seen"] = min(state["seen"] + 1, n_blocks)
+        #Checked here rather than per step: a step is a whole denoise pass, so a
+        #cancel would not land for tens of seconds. A block is the finest point
+        #the host can be answered from while sampling holds the actor.
+        _stop_if_cancelled()
+        progress.write(state["step"] * n_blocks + state["seen"],
+                       state["steps"] * n_blocks, preview_seq=state["pseq"])
+
+    # ComfyUI maps a preview through ((x + 1) / 2).clamp(0, 1), which assumes
+    # the latent-to-RGB projection lands in -1..1. Video latents grow past that
+    # as denoising proceeds, so everything clamps to zero and every preview
+    # after the first is black. Rescale to the actual range first, ignoring
+    # outliers, so the fixed affine has something sensible to work with.
+    import latent_preview
+
+    original_preview_to_image = latent_preview.preview_to_image
+
+    def _ranged_preview_to_image(latent_image, do_scale=True):
+        try:
+            flat = latent_image.flatten().float()
+            if flat.numel() > 1:
+                low = torch.quantile(flat, 0.01)
+                high = torch.quantile(flat, 0.99)
+                if torch.isfinite(low) and torch.isfinite(high) and high > low:
+                    latent_image = ((latent_image - low) / (high - low)) * 2.0 - 1.0
+        except Exception:
+            pass
+        return original_preview_to_image(latent_image, do_scale)
+
+    latent_preview.preview_to_image = _ranged_preview_to_image
+
+    previous = comfy_utils.PROGRESS_BAR_HOOK
+    comfy_utils.set_progress_bar_global_hook(on_step)
+    handles = []
+    try:
+        for block in blocks:
+            try:
+                handles.append(block.register_forward_hook(on_block))
+            except Exception:
+                pass
+        yield
+    finally:
+        for handle in handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        comfy_utils.set_progress_bar_global_hook(previous)
+        latent_preview.preview_to_image = original_preview_to_image
+        progress.clear()
+
+
+def _sampler_step_count(signature, args, kwargs):
+    """Best effort step count so the bar is scaled correctly from the start.
+
+    Without it the bar is sized for one step, fills as the first step's blocks
+    run, then snaps backwards when the real total arrives.
+    """
+    try:
+        bound = signature.bind_partial(*args, **kwargs)
+        sigmas = bound.arguments.get("sigmas")
+        if sigmas is not None:
+            return max(int(sigmas.shape[-1]) - 1, 1)
+        steps = bound.arguments.get("steps")
+        if steps:
+            return max(int(steps), 1)
+    except Exception:
+        pass
+    return 1
+
+
+def report_progress(fn):
+    signature = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        steps = _sampler_step_count(signature, (self,) + args, kwargs)
+        with _progress_reporting(self.model, self.local_rank, steps):
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
+def _with_sampling_patches(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *args, sampling_patches=(), **kwargs):
+        if not sampling_patches:
+            return fn(self, *args, **kwargs)
+        original = self.model
+        try:
+            for patch in sampling_patches:
+                self.model = patch(self.model)
+            return fn(self, *args, **kwargs)
+        finally:
+            try:
+                if self.model is not original:
+                    self.model.unpatch_model(device_to=None, unpatch_weights=False)
+            finally:
+                self.model = original
+    return wrapper
+
+
 class RayWorker:
-    def __init__(self, local_rank, device_id, parallel_dict):
+    def __init__(self, local_rank, device_id, config: RayWorkerConfig, world_size, group_id=0):
         worker_cli_args = _apply_worker_comfy_cli_args_from_env()
         self.model = None
         self.vae_model = None
@@ -382,28 +570,31 @@ class RayWorker:
         self.state_dict = None
         self.cached_controlnet = None  # (path, controlnet_object) cache
         self.lora_list = None
-        self.parallel_dict = parallel_dict
+        self.config = config
+        self.is_quant = False
         self.overwrite_cast_dtype = None
         self.cached_base_model = None
         self.cached_base_key = None
         self.active_request_key = None
 
         self.local_rank = local_rank
-        self.global_world_size = self.parallel_dict["global_world_size"]
-        self.shard_size = self.parallel_dict["shard_size"]
-        self.group_id = self.parallel_dict.get("group_id", 0)
+        self.global_world_size = world_size
+        self.shard_size = world_size // config.parallel.data_parallel_degree if config.fsdp_enabled else world_size
+        self.group_id = group_id
 
         self.device_id = device_id
-        self.parallel_dict = parallel_dict
         self.device = torch.device(f"cuda:{self.device_id}")
+        if config.numa_bind:
+            # Place subsequent allocations and process-group threads near this GPU.
+            placement = bind_to_gpu_node(self.device_id)
+            if placement is not None:
+                print(f"[Raylight][NUMA] rank {self.local_rank} pinned to {placement}", flush=True)
         self.device_mesh = None
         self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
-        self.pipefusion_config = PipeFusionConfig.from_parallel_dict(self.parallel_dict)
-        self.pipefusion_stage = None
         self.xfuser_parallel = None
 
         self.is_model_loaded = False
-        self.is_cpu_offload = self.parallel_dict.get("fsdp_cpu_offload", False)
+        self.is_cpu_offload = config.fsdp_cpu_offload
 
         os.environ["XDIT_LOGGING_LEVEL"] = "WARN"
         os.environ["NCCL_DEBUG"] = "WARN"
@@ -416,10 +607,10 @@ class RayWorker:
 
         patch_base_getattr()
 
-        if self.parallel_dict.get("use_group_process_group") and self.parallel_dict.get("shard_size") is not None:
-            nccl_world_size = self.parallel_dict["shard_size"]
+        if config.fsdp_enabled and config.parallel.data_parallel_degree > 1:
+            nccl_world_size = self.shard_size
         else:
-            nccl_world_size = self.parallel_dict["global_world_size"]
+            nccl_world_size = world_size
         nccl_rank = local_rank
 
         # Each group gets its own port for NCCL isolation
@@ -431,35 +622,37 @@ class RayWorker:
             "nccl",
             rank=nccl_rank,
             world_size=nccl_world_size,
-            timeout=timedelta(minutes=1),
+            timeout=timedelta(minutes=config.collective_timeout_minutes),
             init_method=f"tcp://{master_addr}:{group_port}",
         )
 
-        if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
-            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(nccl_world_size,))
+        if config.parallel.enabled or config.fsdp_enabled:
+            with collective_group_timeout(timedelta(minutes=config.collective_timeout_minutes)):
+                self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(nccl_world_size,))
 
         # Just experimenting, user can't trigger this
-        elif not self.parallel_dict.get("pipefusion_enabled"):
+        else:
             print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
 
-        if requires_xfuser_parallel(self.parallel_dict):
+        if config.parallel.enabled or config.model_options.minimax.enabled:
             self.xfuser_parallel = initialize_xfuser_parallel(
                 local_rank=self.local_rank,
                 world_size=nccl_world_size,
-                parallel_dict=self.parallel_dict,
+                config=config,
             )
-            if self.parallel_dict["is_xdit"]:
+            if config.parallel.enabled:
                 print("XDiT is enable")
-            if self.parallel_dict.get("pipefusion_enabled"):
-                print("PipeFusion xFuser topology is enable")
             print(
                 "Parallel Degree: "
                 f"Ulysses={self.xfuser_parallel.config.ulysses_degree}, "
                 f"Ring={self.xfuser_parallel.config.ring_degree}, "
                 f"CFG={self.xfuser_parallel.config.cfg_degree}, "
-                f"PP={self.xfuser_parallel.config.pp_degree}, "
                 f"DP={self.xfuser_parallel.config.data_parallel_degree}"
             )
+
+    @property
+    def parallel_dict(self):
+        return self.config.as_parallel_dict(self.global_world_size, self.group_id, self.is_quant)
 
     def get_meta_model(self):
         base_model = getattr(self.model, "model", self.model)
@@ -469,7 +662,7 @@ class RayWorker:
         else:
             raise ValueError("Model recieved is not meta, can cause OOM in large model")
 
-    def set_meta_model(self, model):
+    def set_meta_model(self, model, unet_path, model_options):
         base_model = getattr(model, "model", model)
         first_param_device = next(base_model.parameters()).device
         if first_param_device == torch.device("meta"):
@@ -480,6 +673,9 @@ class RayWorker:
             self.state_dict = None
             self.model = model
             self.model.config_fsdp(self.local_rank, self.device_mesh)
+            self.active_request_key = self._active_model_key(unet_path, model_options)
+            self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
+            self.is_model_loaded = True
         else:
             raise ValueError("Model being set is not meta, can cause OOM in large model")
 
@@ -519,6 +715,7 @@ class RayWorker:
 
     def _free_cached_aux_models(self):
         """Free cached ControlNet and VAE GPU memory."""
+        model_management.reset_cast_buffers()
         if self.cached_controlnet is not None:
             _, old_cnet = self.cached_controlnet
             old_model = getattr(old_cnet, "control_model", None)
@@ -546,6 +743,13 @@ class RayWorker:
             comfy_model_management.unload_all_models()
         except Exception as e:
             print(f"[Rank {self.local_rank}] unload_all_models failed in clear_sampling_vram: {e}")
+        model_management.reset_cast_buffers()
+
+        if self.model is not None and hasattr(self.model, "offload_fsdp_vram"):
+            try:
+                self.model.offload_fsdp_vram()
+            except Exception as e:
+                print(f"[Rank {self.local_rank}] offload_fsdp_vram failed in clear_sampling_vram: {e}")
 
         if self.model is not None:
             try:
@@ -576,6 +780,10 @@ class RayWorker:
                 pass
         comfy_model_management.soft_empty_cache()
         return True
+
+    def _restore_sampling_vram(self):
+        if self.model is not None and hasattr(self.model, "restore_fsdp_vram"):
+            self.model.restore_fsdp_vram()
 
     def check_model_loaded(self, unet_path, model_options):
         """Check if the currently loaded model matches the given parameters.
@@ -695,7 +903,7 @@ class RayWorker:
 
     def set_state_dict(self):
         if self.state_dict is None:
-            if self.parallel_dict.get("is_fsdp") is True and self.parallel_dict.get("is_quant") is False:
+            if self.config.fsdp_enabled and not self.is_quant:
                 self.model.set_fsdp_state_dict({})
                 return
             raise ValueError("Worker state_dict is None before set_state_dict")
@@ -710,9 +918,9 @@ class RayWorker:
 
     def get_exec_group_info(self):
         if self.xfuser_parallel is None:
-            if self.parallel_dict.get("use_group_process_group"):
+            if self.config.fsdp_enabled and self.config.parallel.data_parallel_degree > 1:
                 dp_rank = self.group_id
-                dp_degree = self.parallel_dict.get("dp_degree", 1)
+                dp_degree = self.config.parallel.data_parallel_degree
             else:
                 dp_rank = self.local_rank
                 dp_degree = self.global_world_size
@@ -725,8 +933,15 @@ class RayWorker:
             }
 
         is_group_leader = (
-            self.xfuser_parallel.sequence_rank == 0 and self.xfuser_parallel.pipeline_rank == 0 and self.xfuser_parallel.cfg_rank == 0
+            self.xfuser_parallel.sequence_rank == 0 and self.xfuser_parallel.cfg_rank == 0
         )
+        if self.config.fsdp_enabled and self.config.parallel.data_parallel_degree > 1:
+            return {
+                "global_rank": self.group_id * self.shard_size + self.local_rank,
+                "dp_rank": self.group_id,
+                "dp_degree": self.config.parallel.data_parallel_degree,
+                "is_group_leader": is_group_leader,
+            }
         return {
             "global_rank": self.xfuser_parallel.global_rank,
             "dp_rank": self.xfuser_parallel.data_parallel_rank,
@@ -744,14 +959,11 @@ class RayWorker:
             "result": result,
         }
 
-    def set_parallel_dict(self, parallel_dict):
-        self.parallel_dict = parallel_dict
-        self.pipefusion_config = PipeFusionConfig.from_parallel_dict(self.parallel_dict)
+    def set_quantized(self, is_quant):
+        self.is_quant = is_quant
 
-    def model_function_runner(self, fn, *args, **kwargs):
-        self.model = fn(self.model, *args, **kwargs)
-
-    def model_function_runner_get_values(self, fn, *args, **kwargs):
+    @_with_sampling_patches
+    def model_function_runner_get_values(self, fn, *args, sampling_patches=(), **kwargs):
         return fn(self.model, *args, **kwargs)
 
     def get_local_rank(self):
@@ -767,85 +979,21 @@ class RayWorker:
             self.model.add_wrapper(pe.WrappersMP.DIFFUSION_MODEL, CFGParallelInjectRegistry.inject(self.model))
 
     def patch_usp(self):
-        self.model.add_callback(
+        self.model.set_attachments("raylight_model_options", self.config.model_options)
+        self.model.remove_callbacks_with_key(pe.CallbacksMP.ON_LOAD, "raylight_usp")
+        self.model.add_callback_with_key(
             pe.CallbacksMP.ON_LOAD,
+            "raylight_usp",
             USPInjectRegistry.inject,
         )
 
-    def patch_pipefusion(self):
-        if not self.pipefusion_config.enabled:
-            return
-        if self.parallel_dict.get("is_fsdp"):
-            raise ValueError("PipeFusion v1 cannot be enabled together with FSDP")
-        if self.xfuser_parallel is None:
-            raise RuntimeError("PipeFusion requires xFuser model parallel state to be initialized")
-        if self.xfuser_parallel.config.cfg_degree != 1:
-            raise NotImplementedError("PipeFusion currently ignores CFG parallel execution; keep cfg_degree at 1")
-        if self.xfuser_parallel.sequence_world_size != 1:
-            raise NotImplementedError(
-                "PipeFusion topology is now initialized through xFuser, but the Wan execution path does not yet combine PP with USP"
-            )
+    def patch_model_options(self):
+        if self.config.model_options.minimax.enabled and isinstance(self.model.model, model_base.MiniMaxH3):
+            self.patch_usp()
 
-        base_model = getattr(self.model, "model", self.model)
-        if not hasattr(base_model, "diffusion_model") or not hasattr(base_model.diffusion_model, "blocks"):
-            raise ValueError(f"PipeFusion requires a Wan diffusion model with blocks, got {type(base_model).__name__}")
-
-        self.pipefusion_stage = getattr(self.model, "pipefusion_stage", None)
-        if self.pipefusion_stage is None:
-            self.pipefusion_stage = build_stage_plan(
-                total_blocks=getattr(
-                    base_model.diffusion_model, "_raylight_pipefusion_total_blocks", len(base_model.diffusion_model.blocks)
-                ),
-                rank=self.xfuser_parallel.pipeline_rank,
-                world_size=self.xfuser_parallel.pipeline_world_size,
-                config=self.pipefusion_config,
-                group_ranks=tuple(self.xfuser_parallel.pp_group().ranks),
-            )
-
-        runtime = PipeFusionRuntime(
-            config=self.pipefusion_config,
-            stage=self.pipefusion_stage,
-            model_name=type(base_model).__name__,
-            parallel=self.xfuser_parallel,
-        )
-        if runtime.debug:
-            print(
-                "[PipeFusion] "
-                f"global_rank={self.xfuser_parallel.global_rank} "
-                f"pp_group={self.pipefusion_stage.group_ranks} "
-                f"stage={self.pipefusion_stage.stage_start}:{self.pipefusion_stage.stage_end} "
-                f"patches={self.pipefusion_stage.num_pipeline_patch}"
-            )
-        self.model.set_attachments(PIPEFUSION_RUNTIME_ATTACHMENT, runtime)
-
-        self.model.remove_callbacks_with_key(pe.CallbacksMP.ON_LOAD, PIPEFUSION_WRAPPER_KEY)
-        self.model.remove_wrappers_with_key(pe.WrappersMP.OUTER_SAMPLE, PIPEFUSION_WRAPPER_KEY)
-        self.model.remove_wrappers_with_key(pe.WrappersMP.PREDICT_NOISE, PIPEFUSION_WRAPPER_KEY)
-        self.model.remove_wrappers_with_key(pe.WrappersMP.DIFFUSION_MODEL, PIPEFUSION_WRAPPER_KEY)
-
-        self.model.add_callback_with_key(
-            pe.CallbacksMP.ON_LOAD,
-            PIPEFUSION_WRAPPER_KEY,
-            PipeFusionInjectRegistry.inject,
-        )
-        self.model.add_wrapper_with_key(
-            pe.WrappersMP.OUTER_SAMPLE,
-            PIPEFUSION_WRAPPER_KEY,
-            pipefusion_outer_sample_wrapper,
-        )
-        self.model.add_wrapper_with_key(
-            pe.WrappersMP.PREDICT_NOISE,
-            PIPEFUSION_WRAPPER_KEY,
-            pipefusion_predict_noise_wrapper,
-        )
-        self.model.add_wrapper_with_key(
-            pe.WrappersMP.DIFFUSION_MODEL,
-            PIPEFUSION_WRAPPER_KEY,
-            pipefusion_diffusion_model_wrapper,
-        )
-
+    @minimax_precision_loading
     def load_unet(self, unet_path, model_options):
-        if self.parallel_dict["is_fsdp"] is True:
+        if self.config.fsdp_enabled:
             active_key = self._active_model_key(unet_path, model_options)
 
             # Fast path: same base model + same LoRA — reuse FSDP-wrapped model
@@ -873,7 +1021,7 @@ class RayWorker:
             from raylight.comfy_dist.sd import fsdp_load_diffusion_model
 
             fsdp_model_options = dict(model_options)
-            fsdp_model_options["use_mmap"] = self.parallel_dict.get("use_mmap", True)
+            fsdp_model_options["use_mmap"] = self.config.use_mmap
 
             model_patcher.LowVramPatch = LowVramPatch
             model_management.cleanup_models_gc = cleanup_models_gc
@@ -897,13 +1045,13 @@ class RayWorker:
             model_management.soft_empty_cache()
             gc.collect()
 
-            if self.parallel_dict.get("is_quant", False):
+            if self.is_quant:
                 self.set_state_dict()
 
             if self.lora_list is not None:
                 self.load_lora()
 
-            if self.parallel_dict.get("is_quant", False):
+            if self.is_quant:
                 self._patch_fsdp_for_sampling()
 
             base_model = getattr(self.model, "model", self.model)
@@ -917,8 +1065,8 @@ class RayWorker:
             base_key = self._base_model_key(unet_path, model_options)
             active_key = self._active_model_key(unet_path, model_options)
             use_mmap = (
-                self.parallel_dict.get("use_mmap", True)
-                and not self.parallel_dict.get("is_quant", False)
+                self.config.use_mmap
+                and not self.is_quant
                 and unet_path.lower().endswith(".safetensors")
             )
 
@@ -956,21 +1104,7 @@ class RayWorker:
             self._reset_active_model()
             self._invalidate_non_fsdp_cache()
             self._free_cached_aux_models()
-            if self.parallel_dict.get("pipefusion_enabled"):
-                from raylight.comfy_dist.sd import pipefusion_load_diffusion_model
-
-                if self.xfuser_parallel is None:
-                    raise RuntimeError("PipeFusion model loading requires xFuser parallel context")
-
-                pipefusion_model_options = dict(model_options)
-                pipefusion_model_options["use_mmap"] = use_mmap
-                loaded_model = pipefusion_load_diffusion_model(
-                    unet_path,
-                    pipefusion_config=self.pipefusion_config,
-                    parallel_context=self.xfuser_parallel,
-                    model_options=pipefusion_model_options,
-                )
-            elif use_mmap:
+            if use_mmap:
                 from raylight.comfy_dist.sd import lazy_load_diffusion_model
 
                 try:
@@ -995,12 +1129,16 @@ class RayWorker:
             return
 
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype, use_mmap=None):
+        if use_mmap is None:
+            use_mmap = self.config.use_mmap
+        model_options = {"loader": "gguf", "dequant_dtype": dequant_dtype, "patch_dtype": patch_dtype, "use_mmap": use_mmap}
+        active_key = self._active_model_key(unet_path, model_options)
+        if self.check_model_loaded(unet_path, model_options):
+            return
         self._reset_active_model()
         self._invalidate_non_fsdp_cache()
         self._free_cached_aux_models()
-        if use_mmap is None:
-            use_mmap = self.parallel_dict.get("use_mmap", True)
-        if self.parallel_dict["is_fsdp"] is True:
+        if self.config.fsdp_enabled:
             # GGUF FSDP stays disabled for now.
             raise RuntimeError("FSDP on GGUF is not supported")
         else:
@@ -1023,6 +1161,8 @@ class RayWorker:
             self.load_lora()
 
         self.is_model_loaded = True
+        self.active_request_key = active_key
+        self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
 
     def set_lora_list(self, lora):
         self.lora_list = lora
@@ -1047,31 +1187,31 @@ class RayWorker:
             lora_model = comfy_utils.load_torch_file(lora_path, safe_load=True)
 
             if lora.get("minimax_h3_turbo"):
-                if self.parallel_dict["is_fsdp"] is True:
+                if self.config.fsdp_enabled:
                     print(f"[RayWorker {self.local_rank}] MiniMax H3 Turbo LoRA under FSDP "
                           f"(mode={lora.get('low_vram') and 'merge' or 'bypass'})")
                 self.model = apply_turbo_lora(
                     self.model, lora_model, strength_model,
                     low_vram=lora.get("low_vram", False),
-                    fsdp=self.parallel_dict["is_fsdp"] is True,
+                    fsdp=self.config.fsdp_enabled,
                 )
                 del lora_model
                 continue
 
-            if self.parallel_dict["is_fsdp"] is True:
+            if self.config.fsdp_enabled:
                 from raylight.comfy_dist.sd import (
                     load_lora_for_models as ray_load_lora_for_models,
                     load_lora_for_models_quantized as ray_load_lora_for_models_quantized,
                 )
 
                 dynamic_sidecar = comfy_memory_management.aimdo_enabled
-                if self.parallel_dict["is_quant"] is True or dynamic_sidecar:
+                if self.is_quant or dynamic_sidecar:
                     self.model = ray_load_lora_for_models_quantized(
                         self.model,
                         lora_model,
                         strength_model,
                         dynamic_sidecar=dynamic_sidecar,
-                        fallback_to_patches=not self.parallel_dict["is_quant"],
+                        fallback_to_patches=not self.is_quant,
                     )
                 else:
                     self.model = ray_load_lora_for_models(
@@ -1096,6 +1236,7 @@ class RayWorker:
 
         # Free old VAE before loading new one
         if self.vae_model is not None:
+            model_management.reset_cast_buffers()
             del self.vae_model
             self.vae_model = None
             self._cached_vae_path = None
@@ -1118,20 +1259,50 @@ class RayWorker:
             raise RuntimeError("No VAE loaded on this Ray worker; connect RayVAELoader before using worker VAE decode")
         return self.vae_model.decode(samples).cpu()
 
+    def ray_vae_decode_load(self, vae_path):
+        decode_progress.check_cancel(force=True)
+        self.ray_vae_loader(vae_path)
+        decode_progress.check_cancel()
+
+    @ray.method(num_returns=2)
     @patch_ray_tqdm
     def ray_vae_decode_partial(self, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8, job_rank=0, job_world_size=1):
-        return ray_vae_decode_partial_impl(self, samples, tile_size, overlap, temporal_size, temporal_overlap, job_rank, job_world_size)
+        return ray_vae_decode_partial_impl(self, samples, tile_size, overlap, temporal_size, temporal_overlap, job_rank, job_world_size), None
+
+    def ray_vae_decode_spatial_combine(self, *worker_partials):
+        return ray_vae_decode_finalize_impl(self, combine_dist_vae_partials(worker_partials))
+
+    def ray_vae_decode_mode(self):
+        return vae_decode_mode(self.vae_model)
+
+    @patch_ray_tqdm
+    def ray_vae_decode_native(self, samples):
+        return ray_vae_decode_native_impl(self, samples)
+
+    @ray.method(num_returns=2)
+    @patch_ray_tqdm
+    def ray_vae_decode_temporal_partial(self, samples, job_rank=0, job_world_size=1):
+        return ray_vae_decode_temporal_partial_impl(self, samples, job_rank, job_world_size), None
+
+    def ray_vae_decode_temporal_combine(self, *worker_partials):
+        return ray_vae_decode_temporal_combine_impl(self, worker_partials)
 
     def ray_vae_decode_finalize(self, decoded):
         return ray_vae_decode_finalize_impl(self, decoded)
 
+    @ray.method(num_returns=2)
     @patch_ray_tqdm
     def ray_seedvr2_vae_decode_partial(self, samples, tile_size, overlap=64, job_rank=0, job_world_size=1):
-        return ray_seedvr2_vae_decode_partial_impl(self, samples, tile_size, overlap, job_rank, job_world_size)
+        return ray_seedvr2_vae_decode_partial_impl(self, samples, tile_size, overlap, job_rank, job_world_size), None
 
+    def ray_seedvr2_vae_decode_combine(self, *worker_partials):
+        return ray_vae_decode_finalize_impl(self, combine_seedvr2_vae_partials(worker_partials))
+
+    @report_progress
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
     @patch_enable_comfy_kitchen_fsdp
+    @_with_sampling_patches
     def custom_sampler_advanced(
         self,
         add_noise,
@@ -1141,6 +1312,8 @@ class RayWorker:
         sigmas,
         latent_image,
         grouped_output=False,
+        *,
+        sampling_patches=(),
     ):
         import comfy.model_management as comfy_model_management
         import comfy.nested_tensor as comfy_nested_tensor
@@ -1148,8 +1321,10 @@ class RayWorker:
         import comfy.utils as comfy_utils
         import latent_preview
 
+        self._restore_sampling_vram()
+
         for cond_list in _get_guider_conditionings(guider_spec):
-            _restore_controlnet_refs(cond_list, self.cached_controlnet, self.vae_model)
+            _restore_controlnet_refs(cond_list, self._load_controlnet_ref)
             _remap_conditioning_devices(cond_list, None)
             _prepare_control_models(cond_list, None)
 
@@ -1170,7 +1345,7 @@ class RayWorker:
         if "noise_mask" in latent:
             noise_mask = latent["noise_mask"]
 
-        if self.parallel_dict["is_fsdp"] is True:
+        if self.config.fsdp_enabled:
             self._patch_fsdp_for_sampling()
             del self.state_dict
             self.state_dict = None
@@ -1226,9 +1401,11 @@ class RayWorker:
             return self._grouped_sampling_result(result)
         return result
 
+    @report_progress
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
     @patch_enable_comfy_kitchen_fsdp
+    @_with_sampling_patches
     def custom_sampler(
         self,
         add_noise,
@@ -1240,14 +1417,18 @@ class RayWorker:
         sigmas,
         latent_image,
         grouped_output=False,
+        *,
+        sampling_patches=(),
     ):
         import comfy.model_management as comfy_model_management
         import comfy.sample as comfy_sample
         import comfy.utils as comfy_utils
 
+        self._restore_sampling_vram()
+
         # Restore ControlNet refs from local cache (loaded by load_controlnet)
-        _restore_controlnet_refs(positive, self.cached_controlnet, self.vae_model)
-        _restore_controlnet_refs(negative, self.cached_controlnet, self.vae_model)
+        _restore_controlnet_refs(positive, self._load_controlnet_ref)
+        _restore_controlnet_refs(negative, self._load_controlnet_ref)
 
         latent = latent_image
         latent_image = latent["samples"]
@@ -1267,7 +1448,7 @@ class RayWorker:
         _remap_conditioning_devices(positive, negative)
         _prepare_control_models(positive, negative)
 
-        if self.parallel_dict["is_fsdp"] is True:
+        if self.config.fsdp_enabled:
             self._patch_fsdp_for_sampling()
             del self.state_dict
             self.state_dict = None
@@ -1307,6 +1488,14 @@ class RayWorker:
             return self._grouped_sampling_result(out)
         return out
 
+    def _load_controlnet_ref(self, control):
+        self.load_controlnet(control.controlnet_path)
+        vae = None
+        if control.needs_vae:
+            self.ray_vae_loader(control.vae_path)
+            vae = self.vae_model
+        return self.cached_controlnet[1], vae
+
     def load_controlnet(self, controlnet_path):
         """Load a ControlNet model from disk into the worker.
 
@@ -1342,6 +1531,7 @@ class RayWorker:
     def free_cached_controlnet(self):
         """Explicitly free the cached ControlNet (e.g. when switching workflows)."""
         if self.cached_controlnet is not None:
+            model_management.reset_cast_buffers()
             _, old_cnet = self.cached_controlnet
             old_model = getattr(old_cnet, "control_model", None)
             if old_model is not None:
@@ -1355,6 +1545,7 @@ class RayWorker:
     def free_cached_vae(self):
         """Explicitly free the cached VAE (e.g. when switching workflows)."""
         if self.vae_model is not None:
+            model_management.reset_cast_buffers()
             del self.vae_model
             self.vae_model = None
             self._cached_vae_path = None
@@ -1363,9 +1554,11 @@ class RayWorker:
             if self.local_rank == 0:
                 print(f"[Rank {self.local_rank}] VAE cache freed")
 
+    @report_progress
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
     @patch_enable_comfy_kitchen_fsdp
+    @_with_sampling_patches
     def common_ksampler(
         self,
         seed,
@@ -1382,19 +1575,23 @@ class RayWorker:
         last_step=None,
         force_full_denoise=False,
         grouped_output=False,
+        *,
+        sampling_patches=(),
     ):
         import comfy.model_management as comfy_model_management
         import comfy.sample as comfy_sample
         import comfy.utils as comfy_utils
 
+        self._restore_sampling_vram()
+
         # Restore ControlNet refs from local cache (loaded by load_controlnet)
-        _restore_controlnet_refs(positive, self.cached_controlnet, self.vae_model)
-        _restore_controlnet_refs(negative, self.cached_controlnet, self.vae_model)
+        _restore_controlnet_refs(positive, self._load_controlnet_ref)
+        _restore_controlnet_refs(negative, self._load_controlnet_ref)
 
         latent_image = latent["samples"]
         latent_image = comfy_sample.fix_empty_latent_channels(self.model, latent_image)
 
-        if self.parallel_dict["is_fsdp"] is True:
+        if self.config.fsdp_enabled:
             self._patch_fsdp_for_sampling()
 
         if disable_noise:
@@ -1455,7 +1652,7 @@ class RayWorker:
 
 
 class RayCOMMTester:
-    def __init__(self, local_rank, world_size, device_id):
+    def __init__(self, local_rank, world_size, device_id, collective_timeout_minutes=1.0):
         device = torch.device(f"cuda:{device_id}")
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
 
@@ -1463,7 +1660,7 @@ class RayCOMMTester:
             "nccl",
             rank=local_rank,
             world_size=world_size,
-            timeout=timedelta(minutes=1),
+            timeout=timedelta(minutes=collective_timeout_minutes),
             # device_id=self.device
         )
         print("Running COMM pre-run")
@@ -1486,7 +1683,7 @@ class RayCOMMTester:
         ray.actor.exit_actor()
 
 
-def ray_nccl_tester(world_size):
+def ray_nccl_tester(world_size, collective_timeout_minutes=1.0):
     gpu_actor = ray.remote(RayCOMMTester)
     gpu_actors = []
 
@@ -1496,6 +1693,7 @@ def ray_nccl_tester(world_size):
                 local_rank=local_rank,
                 world_size=world_size,
                 device_id=0,
+                collective_timeout_minutes=collective_timeout_minutes,
             )
         )
     for actor in gpu_actors:
@@ -1505,76 +1703,155 @@ def ray_nccl_tester(world_size):
         actor.kill.remote()
 
 
-def make_ray_actor_fn(world_size, parallel_dict):
-    num_replicas = parallel_dict.get("dp_degree", 1)
-    shard_size = parallel_dict.get("shard_size", world_size)
-    use_group_process_group = bool(parallel_dict.get("use_group_process_group"))
+def make_ray_actor_fn(world_size, config):
+    num_replicas = config.worker.parallel.data_parallel_degree
+    shard_size = world_size // num_replicas
+    use_group_process_group = config.worker.fsdp_enabled and num_replicas > 1
 
-    def _init_ray_actor(world_size=world_size, parallel_dict=parallel_dict):
-        ray_actors = dict()
+    def _init_ray_actor():
         gpu_actor = ray.remote(RayWorker)
         gpu_actors = []
+        worker_specs = []
 
         if num_replicas <= 1 or not use_group_process_group:
             # XDiT DP stays in one global group; xFuser derives DP ranks internally.
             for local_rank in range(world_size):
-                gpu_actors.append(
-                    gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
-                        local_rank=local_rank,
-                        device_id=0,
-                        parallel_dict=parallel_dict,
-                    )
-                )
+                worker_specs.append((local_rank, f"RayWorker:{local_rank}", 0))
         else:
             # FSDP multi-replica DP uses one NCCL group per replica.
             for group_id in range(num_replicas):
-                group_parallel_dict = dict(parallel_dict)
-                group_parallel_dict["group_id"] = group_id
-                group_parallel_dict["use_group_process_group"] = True
-
                 for local_rank in range(shard_size):
-                    gpu_actors.append(
-                        gpu_actor.options(
-                            num_gpus=1,
-                            name=f"RayWorker:{group_id}_{local_rank}"
-                        ).remote(
-                            local_rank=local_rank,
-                            device_id=0,
-                            parallel_dict=group_parallel_dict,
-                        )
-                    )
+                    worker_specs.append((local_rank, f"RayWorker:{group_id}_{local_rank}", group_id))
 
-        ray_actors["workers"] = gpu_actors
-
-        for actor in ray_actors["workers"]:
-            ray.get(actor.__ray_ready__.remote())
-        return ray_actors
+        try:
+            for local_rank, name, group_id in worker_specs:
+                gpu_actors.append(gpu_actor.options(num_gpus=1, name=name).remote(
+                    local_rank=local_rank, device_id=0, config=config.worker, world_size=world_size, group_id=group_id))
+            ray.get([actor.__ray_ready__.remote() for actor in gpu_actors], timeout=120)
+            worker_processes = ray.get([
+                actor.__ray_call__.remote(lambda self: (socket.gethostname(), os.getpid(), psutil.Process().create_time()))
+                for actor in gpu_actors
+            ], timeout=30)
+        except Exception:
+            for actor in gpu_actors:
+                ray.kill(actor, no_restart=True)
+            raise
+        _note_workers_spawned(name for _, name, _ in worker_specs)
+        return {"workers": gpu_actors, "worker_processes": worker_processes, "config": config}
 
     return _init_ray_actor
 
 
-# (TODO-Komikndr) Should be removed since FSDP can be unloaded properly
+_ACTOR_GENERATION = 0
+
+
+def actor_generation():
+    """Bumped whenever the workers are retired.
+
+    ensure_fresh_actors lives in the loader, and the loader is a node: with its
+    inputs unchanged comfy serves a cached result and never calls it, so killing
+    workers on their own leaves the graph holding handles to dead actors. The
+    loader reports this from IS_CHANGED, which puts the respawn back under comfy's
+    own cache rules.
+    """
+    return _ACTOR_GENERATION
+
+
+_WORKER_EPOCH = 0
+_WORKERS_SEEN_ALIVE = False
+_WORKER_NAMES = ()
+
+
+def _workers_alive():
+    if not ray.is_initialized() or not _WORKER_NAMES:
+        return False
+    try:
+        ray.get([ray.get_actor(n).get_is_model_loaded.remote() for n in _WORKER_NAMES], timeout=10)
+    except Exception:
+        return False
+    return True
+
+
+def _note_workers_spawned(names):
+    """Count workers that just came up as seen alive.
+
+    worker_epoch only bumps for workers it has seen alive, and it looks only when
+    comfy asks the initializer IS_CHANGED. Workers spawned and lost between two of
+    those checks - a render that dies on its first run - would otherwise never be
+    noticed, and the next run would be handed their dead handles.
+    """
+    global _WORKERS_SEEN_ALIVE, _WORKER_NAMES
+    _WORKER_NAMES = tuple(names)
+    _WORKERS_SEEN_ALIVE = True
+
+
+def worker_epoch():
+    """Bumped once each time workers that were alive are found dead.
+
+    Workers can die outside retire_actors - killed by hand, reaped by the reset
+    workflow's ray.shutdown(), or crashed - and then nothing bumps
+    actor_generation. The initializer reports this from IS_CHANGED so everything
+    below it re-runs on fresh workers instead of meeting dead handles. It stays
+    put once new workers are up, so the next run cache-hits as usual. Never
+    starts a cluster: with ray down there is nothing to ping.
+    """
+    global _WORKER_EPOCH, _WORKERS_SEEN_ALIVE
+    if _workers_alive():
+        _WORKERS_SEEN_ALIVE = True
+    elif _WORKERS_SEEN_ALIVE:
+        _WORKERS_SEEN_ALIVE = False
+        _WORKER_EPOCH += 1
+        logging.warning("[Raylight] workers are gone; the initializer will run again")
+    return _WORKER_EPOCH
+
+
+def retire_actors(ray_actors, reason):
+    """Kill the workers and make the loader run again next time."""
+    global _ACTOR_GENERATION
+    for actor in ray_actors.get("workers", []):
+        try:
+            ray.kill(actor, no_restart=True)
+        except Exception:
+            pass
+    _ACTOR_GENERATION += 1
+    logging.warning("[Raylight] retired workers after %s; they will be respawned "
+                    "on the next run", reason)
+
+
 def ensure_fresh_actors(ray_actors_init):
     ray_actors, ray_actor_fn = ray_actors_init
     gpu_actors = ray_actors["workers"]
 
     needs_restart = False
     try:
-        is_loaded = ray.get(gpu_actors[0].get_is_model_loaded.remote())
-        if is_loaded:
-            needs_restart = True
-    except RayActorError:
-        # Actor already dead or crashed
+        ray.get([actor.get_is_model_loaded.remote() for actor in gpu_actors], timeout=30)
+    except (RayActorError, ray.exceptions.GetTimeoutError):
         needs_restart = True
 
-    needs_restart = False
     if needs_restart:
         for actor in gpu_actors:
+            # A failed NCCL group cannot be reused; graceful teardown can hang.
+            ray.kill(actor, no_restart=True)
+
+        # Ray releases actor names asynchronously, so recreating RayWorker:N
+        # can still hit ActorAlreadyExistsError for a short window.
+        last_exc = None
+        for _ in range(40):
             try:
-                ray.get(actor.kill.remote())
-            except Exception:
-                pass  # ignore already dead
-        ray_actors = ray_actor_fn()
+                replacement = ray_actor_fn()
+                break
+            except ValueError as exc:
+                if "already taken" not in str(exc):
+                    raise
+                last_exc = exc
+                time.sleep(0.5)
+        else:
+            raise RuntimeError(
+                "Ray worker names were never released, cannot respawn workers. "
+                "Kill the cluster or restart ComfyUI."
+            ) from last_exc
+        ray_actors.clear()
+        ray_actors.update(replacement)
         gpu_actors = ray_actors["workers"]
 
     parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())

@@ -34,6 +34,7 @@ from comfy_kitchen.tensor import (
 
 from .kitchen_patches.fp8 import install_fp8_patches, restore_fp8_patches
 from .kitchen_patches.int8 import install_int8_patches, restore_int8_patches
+from .kitchen_patches.mxfp8 import install_mxfp8_patches, restore_mxfp8_patches
 from .kitchen_patches.nvfp4 import install_nvfp4_patches, restore_nvfp4_patches
 from .native_fp8 import install_native_fp8_collective_patch, restore_native_fp8_collective_patch
 
@@ -42,6 +43,7 @@ _SITEPKG_LAYOUT_PATCHERS = {
     "fp8": (install_fp8_patches, restore_fp8_patches),
     "nvfp4": (install_nvfp4_patches, restore_nvfp4_patches),
     "int8": (install_int8_patches, restore_int8_patches),
+    "mxfp8": (install_mxfp8_patches, restore_mxfp8_patches),
 }
 
 
@@ -52,25 +54,53 @@ def _normalize_layouts(layouts):
         return (layouts,)
     if isinstance(layouts, Iterable):
         return tuple(layouts)
-    return ("fp8", "nvfp4", "int8")
+    return ("fp8", "nvfp4", "int8", "mxfp8")
 
 
-def install_sitepkg_ck_patches(layouts=("fp8", "nvfp4", "int8")):
-    for layout in _normalize_layouts(layouts):
+#A patched scope can call into another one - loading a model from inside a
+#sampler or an encode does exactly that - and the inner install is a no-op
+#because the layout is already patched. Its restore is not, so without a count
+#of the open scopes the inner exit strips the patches the outer one is still
+#using. Touch the layout classes only at the outermost edges.
+_SITEPKG_PATCH_DEPTH = {}
+
+
+def install_sitepkg_ck_patches(layouts=("fp8", "nvfp4", "int8", "mxfp8")):
+    installed = []
+    try:
+        for layout in _normalize_layouts(layouts):
+            patcher = _SITEPKG_LAYOUT_PATCHERS.get(layout)
+            if patcher is None:
+                continue
+            depth = _SITEPKG_PATCH_DEPTH.get(layout, 0)
+            if depth == 0:
+                try:
+                    patcher[0]()
+                except Exception:
+                    patcher[1]()
+                    raise
+            _SITEPKG_PATCH_DEPTH[layout] = depth + 1
+            installed.append(layout)
+    except Exception:
+        restore_sitepkg_ck_patches(installed)
+        raise
+
+
+def restore_sitepkg_ck_patches(layouts=("fp8", "nvfp4", "int8", "mxfp8")):
+    for layout in reversed(_normalize_layouts(layouts)):
         patcher = _SITEPKG_LAYOUT_PATCHERS.get(layout)
-        if patcher is not None:
-            patcher[0]()
-
-
-def restore_sitepkg_ck_patches(layouts=("fp8", "nvfp4", "int8")):
-    for layout in _normalize_layouts(layouts):
-        patcher = _SITEPKG_LAYOUT_PATCHERS.get(layout)
-        if patcher is not None:
+        if patcher is None:
+            continue
+        depth = _SITEPKG_PATCH_DEPTH.get(layout, 0)
+        if depth == 0:
+            continue
+        if depth == 1:
             patcher[1]()
+        _SITEPKG_PATCH_DEPTH[layout] = depth - 1
 
 
 @contextmanager
-def temporary_sitepkg_ck_patches(layouts=("fp8", "nvfp4", "int8")):
+def temporary_sitepkg_ck_patches(layouts=("fp8", "nvfp4", "int8", "mxfp8")):
     install_sitepkg_ck_patches(layouts=layouts)
     try:
         yield
@@ -86,8 +116,8 @@ def patch_enable_comfy_kitchen_fsdp(fn):
     @wraps(fn)
     def wrapper(self, *args, **kwargs):
         patched = False
-        layouts = self.parallel_dict.get("comfy_kitchen_layouts", ("fp8", "nvfp4", "int8"))
-        if self.parallel_dict.get("is_fsdp", False):
+        layouts = ("fp8", "nvfp4", "int8", "mxfp8")
+        if self.config.fsdp_enabled:
             install_sitepkg_ck_patches(layouts=layouts)
             install_native_fp8_collective_patch()
             patched = True

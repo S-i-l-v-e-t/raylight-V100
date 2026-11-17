@@ -1,14 +1,19 @@
 import raylight
 import os
 import gc
+import contextlib
 import json
+import logging
 import shutil
+import socket
 import tempfile
+import time
 from typing import Any
 from pathlib import Path
 from copy import deepcopy
 
 import ray
+import psutil
 import torch
 import comfy
 import folder_paths
@@ -21,10 +26,21 @@ from comfy import sd, sample, utils  # type: ignore
 
 from .distributed_worker.ray_worker import (
     make_ray_actor_fn,
+    actor_generation,
+    worker_epoch,
     ensure_fresh_actors,
     ray_nccl_tester,
 )
-from .distributed_worker.ray_worker_vae import combine_dist_vae_partials, combine_seedvr2_vae_partials
+from .distributed_worker.raylightworker_config_schema import LoadingOptions, ModelOptions, RaylightConfig, RayWorkerConfig, XFuserParallelConfig
+from . import decode_progress, progress
+from .comfy_extra_dist.ray_patch_decorator import prepare_ray_model, ray_model_loader
+from .comfy_extra_dist.nodes_custom_sampler import (
+    _clear_ray_worker_vram_after_sampling,
+    _free_host_models_if_contended,
+    _gather_with_progress,
+    _retire_actors_after_fatal,
+    CANCEL_DRAIN_DEFAULT_SECONDS,
+)
 
 
 class AnyType(str):
@@ -35,18 +51,41 @@ class AnyType(str):
 any_type = AnyType("*")
 
 
-def _clear_ray_worker_vram_after_sampling(ray_actors):
+def _free_ray_worker_vram_after_decode(ray_actors, force=False):
     gpu_actors = ray_actors["workers"]
     if not gpu_actors:
         return
-    parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
-    if not parallel_dict.get("clear_vram_after_sampling", False):
-        return
+    if not force:
+        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+        if not parallel_dict.get("clear_vram_after_sampling", False):
+            return
+    try:
+        refs = [actor.free_cached_vae.remote() for actor in gpu_actors]
+        refs += [actor.clear_sampling_vram.remote() for actor in gpu_actors]
+        if force:
+            ray.get(refs, timeout=CANCEL_DRAIN_DEFAULT_SECONDS)
+        else:
+            ray.get(refs)
+    except ray.exceptions.RayError:
+        if not force:
+            raise
+        logging.warning("[Raylight] could not clean up every decode worker")
 
-    ray.get([actor.clear_sampling_vram.remote() for actor in gpu_actors])
-    gc.collect()
-    comfy.model_management.unload_all_models()
-    comfy.model_management.soft_empty_cache()
+
+@contextlib.contextmanager
+def _decode_session(ray_actors):
+    progress.reset_cancel()
+    decode_progress.clear()
+    try:
+        yield
+        _free_ray_worker_vram_after_decode(ray_actors)
+    except Exception as error:
+        _retire_actors_after_fatal(ray_actors, error)
+        _free_ray_worker_vram_after_decode(ray_actors, force=True)
+        raise
+    finally:
+        progress.reset_cancel()
+        decode_progress.clear()
 
 
 def _raylight_ray_tmpdir() -> Path:
@@ -132,6 +171,35 @@ def _sanitized_worker_alloc_conf():
     return ",".join(kept)
 
 
+def _add_nvrtc_library_path(env_vars: dict[str, str]):
+    """Put torch's bundled nvrtc on the worker's loader path.
+
+    A worker does not inherit the loader path the server process has, so a
+    TorchScript function whose fuser compiles through nvrtc fails there with
+
+        nvrtc: error: failed to open libnvrtc-builtins.so.<ver>
+
+    even though the library ships with torch. Ring attention hits this, since
+    yunchang's update_out_and_lse is scripted.
+    """
+    try:
+        import nvidia
+    except ImportError:
+        return
+    roots = [Path(p) for p in getattr(nvidia, "__path__", [])]
+    dirs = []
+    for root in roots:
+        for lib in sorted(root.glob("*/lib")):
+            if any(lib.glob("libnvrtc-builtins.so*")):
+                dirs.append(str(lib))
+    if not dirs:
+        return
+    existing = os.environ.get("LD_LIBRARY_PATH")
+    if existing:
+        dirs.extend(part for part in existing.split(os.pathsep) if part)
+    env_vars["LD_LIBRARY_PATH"] = os.pathsep.join(dict.fromkeys(dirs))
+
+
 def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir: Path):
     python_path_entries = [str(repo_root)]
     existing = os.environ.get("PYTHONPATH")
@@ -143,6 +211,7 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
         "PYTHONPATH": python_path,
         "COMFYUI_BASE_DIRECTORY": str(repo_root),
     }
+    _add_nvrtc_library_path(env_vars)
     alloc_conf = _sanitized_worker_alloc_conf()
     if alloc_conf is not None:
         env_vars["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
@@ -154,33 +223,69 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
     }
 
 
-def _worker_cli_args_env_json() -> str:
+# The shared bundle is updated in place when failed workers are replaced.
+_spawned_workers = {}
+
+
+def _record_spawned_workers(ray_actors):
+    global _spawned_workers
+    _spawned_workers = ray_actors
+
+
+def _wait_for_ray_workers_to_exit(timeout=90.0):
+    """Wait for owned local worker processes, including replacements, to exit."""
+    global _spawned_workers
+    host = socket.gethostname()
+    processes = [(pid, created) for worker_host, pid, created in _spawned_workers.get("worker_processes", []) if worker_host == host]
+    _spawned_workers = {}
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = []
+        for pid, created in processes:
+            try:
+                process = psutil.Process(pid)
+                if process.create_time() == created and process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+                    remaining.append((pid, created))
+            except psutil.NoSuchProcess:
+                pass
+        if not remaining:
+            return True
+        if time.monotonic() >= deadline:
+            logging.warning("[Raylight] workers %s still present after %.0fs", [pid for pid, _ in remaining], timeout)
+            return False
+        processes = remaining
+        time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+
+def _worker_cli_args_env_json(config: RayWorkerConfig) -> str:
     worker_cli_args = {
-        # Ray workers hit cudaHostRegister failures on large LTXV loads often enough
-        # that we disable pinned memory there by default.
-        "disable_pinned_memory": True,
+        "disable_pinned_memory": not config.pinned_memory,
+        "fast_disk": bool(comfy_args.fast_disk),
         "disable_mmap": bool(comfy_args.disable_mmap),
         "mmap_torch_files": bool(comfy_args.mmap_torch_files),
         "disable_smart_memory": bool(comfy_args.disable_smart_memory),
         "disable_async_offload": bool(comfy_args.disable_async_offload),
         "disable_dynamic_vram": bool(comfy_args.disable_dynamic_vram),
         "enable_dynamic_vram": bool(comfy_args.enable_dynamic_vram),
-        "vram_headroom": comfy_args.vram_headroom,
+        "vram_headroom": config.vram_headroom,
         "force_non_blocking": bool(comfy_args.force_non_blocking),
         "deterministic": bool(comfy_args.deterministic),
         "verbose": comfy_args.verbose,
-        "reserve_vram": comfy_args.reserve_vram,
+        "reserve_vram": config.reserve_vram,
         "fp16_intermediates": bool(comfy_args.fp16_intermediates),
         "force_channels_last": bool(comfy_args.force_channels_last),
         "supports_fp8_compute": bool(comfy_args.supports_fp8_compute),
         "enable_triton_backend": bool(comfy_args.enable_triton_backend),
         "fast": sorted(feature.value for feature in comfy_args.fast),
+        # Workers need this to build a previewer; without it they default to
+        # NoPreviews and the sampler never produces preview images to relay.
+        "preview_method": comfy_args.preview_method.value,
     }
     return json.dumps(worker_cli_args, sort_keys=True)
 
 
-def _inject_worker_cli_args(runtime_env: dict[str, Any]):
-    runtime_env.setdefault("env_vars", {})["RAYLIGHT_COMFY_CLI_ARGS_JSON"] = _worker_cli_args_env_json()
+def _inject_worker_cli_args(runtime_env: dict[str, Any], config: RayWorkerConfig):
+    runtime_env.setdefault("env_vars", {})["RAYLIGHT_COMFY_CLI_ARGS_JSON"] = _worker_cli_args_env_json(config)
 
 
 def _parse_gpu_select(gpu_select: str | None) -> tuple[int, ...] | None:
@@ -255,18 +360,6 @@ def _quant_metadata_checker(unet_path: str) -> bool:
         return False
 
 
-def _parse_pipefusion_stage_splits(stage_splits: str | None) -> tuple[int, ...] | None:
-    if stage_splits is None:
-        return None
-    stage_splits = stage_splits.strip()
-    if not stage_splits:
-        return None
-    splits = tuple(int(part.strip()) for part in stage_splits.split(",") if part.strip())
-    if not splits:
-        return None
-    return splits
-
-
 def _effective_parallel_degree(value: int | None) -> int:
     if value is None:
         return 1
@@ -305,74 +398,23 @@ def _validate_unified_parallel_setup(parallel_dict: dict[str, Any], group_infos:
     ulysses_degree = _effective_parallel_degree(parallel_dict.get("ulysses_degree"))
     ring_degree = _effective_parallel_degree(parallel_dict.get("ring_degree"))
     cfg_degree = _effective_parallel_degree(parallel_dict.get("cfg_degree"))
-    pp_degree = _effective_parallel_degree(parallel_dict.get("pp_degree"))
     dp_degree = max(int(info.get("dp_degree", 1)) for info in group_infos) if group_infos else 1
-    effective_parallel_size = ulysses_degree * ring_degree * cfg_degree * pp_degree * dp_degree
+    effective_parallel_size = ulysses_degree * ring_degree * cfg_degree * dp_degree
 
     if effective_parallel_size <= 1:
         raise ValueError(
             f"{label} requires an active unified parallel topology with effective degree > 1. "
-            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, pp={pp_degree}, dp={dp_degree}. "
+            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, dp={dp_degree}. "
             "Use DPKSampler for pure DP or single-worker execution."
         )
 
-    if not parallel_dict.get("is_xdit") and not parallel_dict.get("pipefusion_enabled"):
+    if not parallel_dict.get("is_xdit"):
         raise ValueError(
             f"{label} requires xFuser unified topology to be active. "
-            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, pp={pp_degree}, dp={dp_degree}, "
-            f"is_xdit={parallel_dict.get('is_xdit')}, pipefusion_enabled={parallel_dict.get('pipefusion_enabled')}. "
+            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, dp={dp_degree}, "
+            f"is_xdit={parallel_dict.get('is_xdit')}. "
             "DP-only execution should use DPKSampler."
         )
-
-
-def _reset_pipefusion_runtime_config(parallel_dict: dict[str, Any]):
-    parallel_dict["pipefusion_enabled"] = False
-    parallel_dict["num_pipeline_patch"] = 1
-    parallel_dict["warmup_steps"] = 0
-    parallel_dict["pipefusion_stage_splits"] = None
-    parallel_dict["pipefusion_debug"] = False
-
-
-def _apply_pipefusion_runtime_config(
-    parallel_dict: dict[str, Any],
-    *,
-    world_size: int,
-    num_pipeline_patch: int,
-    warmup_steps: int,
-    stage_splits: str | None,
-    debug: bool,
-):
-    _reset_pipefusion_runtime_config(parallel_dict)
-
-    pp_degree = _effective_parallel_degree(parallel_dict.get("pp_degree"))
-
-    if parallel_dict.get("is_fsdp"):
-        raise ValueError("PipeFusion v1 is exclusive with FSDP")
-    if world_size < 1:
-        raise ValueError("PipeFusion requires at least 1 GPU")
-    if pp_degree < 1:
-        raise ValueError("PipeFusion pp_degree must be at least 1")
-    if num_pipeline_patch <= 0:
-        raise ValueError("PipeFusion num_pipeline_patch must be positive")
-    if warmup_steps < 0:
-        raise ValueError("PipeFusion warmup_steps cannot be negative")
-
-    effective_ulysses = _effective_parallel_degree(parallel_dict.get("ulysses_degree"))
-    effective_ring = _effective_parallel_degree(parallel_dict.get("ring_degree"))
-    effective_cfg = _effective_parallel_degree(parallel_dict.get("cfg_degree"))
-    model_parallel_size = pp_degree * effective_ulysses * effective_ring * effective_cfg
-    if world_size % model_parallel_size != 0:
-        raise ValueError(
-            "PipeFusion requires the Ray worker count to be divisible by "
-            "pp_degree * ulysses_degree * ring_degree * cfg_degree: "
-            f"{world_size} is not divisible by {pp_degree} * {effective_ulysses} * {effective_ring} * {effective_cfg}"
-        )
-
-    parallel_dict["pipefusion_enabled"] = True
-    parallel_dict["num_pipeline_patch"] = num_pipeline_patch
-    parallel_dict["warmup_steps"] = warmup_steps
-    parallel_dict["pipefusion_stage_splits"] = _parse_pipefusion_stage_splits(stage_splits)
-    parallel_dict["pipefusion_debug"] = debug
 
 
 class RayInitializer:
@@ -435,7 +477,7 @@ class RayInitializer:
                     {"default": False, "tooltip": "When FSDP is on, offload inactive model shards to CPU RAM."},
                 ),
                 "XFuser_attention": (
-                    [member.name for member in AttnType],
+                    [member.name for member in AttnType] + ["COMFY_KITCHEN_INT8"],
                     {"default": "TORCH_FLASH", "tooltip": "Attention backend used by xFuser-enabled execution."},
                 ),
                 "skip_comm_test": (
@@ -461,6 +503,12 @@ class RayInitializer:
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        #Dead workers must re-run the initializer, not be served from cache: every
+        #loader and sampler below holds its handles.
+        return worker_epoch()
+
     def spawn_actor(
         self,
         ray_cluster_address: str,
@@ -481,6 +529,13 @@ class RayInitializer:
         ray_object_store_gb: float = 2.0,
         ray_dashboard_address: str = "None",
         torch_dist_address: str = "None",
+        worker_options=None,
+        worker_vram_headroom: float = -1.0,
+        worker_reserve_vram: float = -1.0,
+        worker_pinned_memory: bool = False,
+        parallel_quant_load: bool = False,
+        collective_timeout_minutes: float = 1.0,
+        numa_bind: bool = False,
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -496,7 +551,6 @@ class RayInitializer:
 
         # HF Tokenizer warning when forking
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        self.parallel_dict: dict[str, Any] = dict()
         _monkey()
 
         world_size = GPU
@@ -530,19 +584,7 @@ class RayInitializer:
                 raise ValueError("dp_degree must be >= 1 when FSDP is enabled")
             if GPU % dp_degree != 0:
                 raise ValueError(f"GPU count ({GPU}) must be evenly divisible by dp_degree ({dp_degree})")
-        shard_size = GPU // dp_degree if dp_degree >= 1 else GPU
-
-        self.parallel_dict["is_xdit"] = False
-        self.parallel_dict["is_fsdp"] = False
-        self.parallel_dict["sync_ulysses"] = False
-        self.parallel_dict["global_world_size"] = world_size
-        self.parallel_dict["shard_size"] = shard_size
-        self.parallel_dict["use_group_process_group"] = False
-        self.parallel_dict["use_mmap"] = use_mmap
-        self.parallel_dict["pp_degree"] = 1
-        self.parallel_dict["dp_degree"] = dp_degree if dp_degree >= 1 else 1
-        self.parallel_dict["clear_vram_after_sampling"] = clear_vram_after_sampling
-        _reset_pipefusion_runtime_config(self.parallel_dict)
+        parallel = XFuserParallelConfig(data_parallel_degree=max(dp_degree, 1))
 
         if ulysses_degree > 0 or ring_degree > 0 or cfg_degree > 0:
             model_parallel_size = effective_ulysses_degree * effective_ring_degree * cfg_degree
@@ -562,20 +604,27 @@ class RayInitializer:
                     "GPU count must equal dp_degree x ulysses_degree x ring_degree x cfg_degree: "
                     f"{world_size} != {effective_dp_degree} x {effective_ulysses_degree} x {effective_ring_degree} x {cfg_degree}"
                 )
-            self.parallel_dict["attention"] = XFuser_attention
-            self.parallel_dict["is_xdit"] = True
-            self.parallel_dict["ulysses_degree"] = effective_ulysses_degree
-            self.parallel_dict["ring_degree"] = effective_ring_degree
-            self.parallel_dict["cfg_degree"] = cfg_degree
-            self.parallel_dict["sync_ulysses"] = sync_ulysses
-            self.parallel_dict["dp_degree"] = effective_dp_degree
+            parallel = XFuserParallelConfig(
+                enabled=True, ulysses_degree=effective_ulysses_degree,
+                ring_degree=effective_ring_degree, cfg_degree=cfg_degree,
+                data_parallel_degree=effective_dp_degree,
+            )
 
-        if FSDP:
-            self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
-            self.parallel_dict["is_fsdp"] = True
-            final_dp = self.parallel_dict["dp_degree"]
-            self.parallel_dict["shard_size"] = world_size // final_dp
-            self.parallel_dict["use_group_process_group"] = final_dp > 1
+        worker_config = RayWorkerConfig(
+            parallel=parallel, attention_backend=XFuser_attention,
+            sync_ulysses=sync_ulysses, fsdp_enabled=FSDP, fsdp_cpu_offload=FSDP_CPU_OFFLOAD,
+            use_mmap=use_mmap, clear_vram_after_sampling=clear_vram_after_sampling,
+            selected_gpus=selected_gpus,
+            model_options=worker_options or ModelOptions(),
+            pinned_memory=worker_pinned_memory,
+            vram_headroom=comfy_args.vram_headroom if worker_vram_headroom < 0 else worker_vram_headroom,
+            reserve_vram=comfy_args.reserve_vram if worker_reserve_vram < 0 else worker_reserve_vram,
+            collective_timeout_minutes=collective_timeout_minutes,
+            numa_bind=numa_bind,
+        )
+        config = RaylightConfig(loading=LoadingOptions(parallel_quant_load=parallel_quant_load), worker=worker_config)
+        if worker_config.attention_backend == "COMFY_KITCHEN_INT8" and worker_config.parallel.ring_degree != 1:
+            raise ValueError("Comfy Kitchen INT8 requires ring_degree=1.")
 
         if ray_dashboard_address != "None":
             dashboard_host, dashboard_port = ray_dashboard_address.rsplit(":", 1)
@@ -594,7 +643,11 @@ class RayInitializer:
             # Adapted from avtc's Ray GPU visibility restriction idea.
             runtime_env_base.setdefault("env_vars", {})["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_idx) for gpu_idx in selected_gpus)
 
-        _inject_worker_cli_args(runtime_env_base)
+        _inject_worker_cli_args(runtime_env_base, config.worker)
+
+        # the workers find the progress board by this name; each cluster gets its own
+        board_name = progress.new_board_name()
+        runtime_env_base.setdefault("env_vars", {})[progress.BOARD_ENV] = board_name
 
         if ray_cluster_address in _LOCAL_CLUSTER_ADDRESSES:
             _configure_raylight_ray_tmpdir(runtime_env_base)
@@ -602,8 +655,8 @@ class RayInitializer:
         try:
             # Shut down so if comfy user try another workflow it will not cause error
             ray.shutdown()
+            _wait_for_ray_workers_to_exit()
             _cleanup_ray_temp()
-            RayControlNetLoader._current_controlnet_path = None
             original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
             restricted_cuda_visible_devices = runtime_env_base.get("env_vars", {}).get("CUDA_VISIBLE_DEVICES")
             if restricted_cuda_visible_devices is not None:
@@ -639,13 +692,16 @@ class RayInitializer:
                         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             raise RuntimeError(f"Ray connection failed: {e}")
 
+        progress.create_board(board_name)
+
         if not skip_comm_test:
             print("Running NCCL communication test...")
-            ray_nccl_tester(world_size)
+            ray_nccl_tester(world_size, config.worker.collective_timeout_minutes)
         else:
             print("Skipping NCCL test (skip_comm_test=True)")
-        ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
+        ray_actor_fn = make_ray_actor_fn(world_size, config)
         ray_actors = ray_actor_fn()
+        _record_spawned_workers(ray_actors)
         return ([ray_actors, ray_actor_fn],)
 
 
@@ -716,7 +772,7 @@ class RayInitializerAdvanced(RayInitializer):
                     {"default": False, "tooltip": "When FSDP is on, offload inactive model shards to CPU RAM."},
                 ),
                 "XFuser_attention": (
-                    [member.name for member in AttnType],
+                    [member.name for member in AttnType] + ["COMFY_KITCHEN_INT8"],
                     {"default": "TORCH_FLASH", "tooltip": "Attention backend used by xFuser-enabled execution."},
                 ),
                 "skip_comm_test": (
@@ -753,6 +809,22 @@ class RayInitializerAdvanced(RayInitializer):
                         "tooltip": "Torch distributed master address used by worker-side NCCL init. Restart ComfyUI if you change it.",
                     },
                 ),
+                "worker_options": (
+                    "RAY_MODEL_OPTIONS",
+                    {"tooltip": "Optional RayWorker Minimax Option settings for H3 precision and MLP chunking."},
+                ),
+                "worker_vram_headroom": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 64.0, "step": 0.5, "tooltip": "Worker VRAM headroom in GB. -1 inherits the server setting."}),
+                "worker_reserve_vram": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 64.0, "step": 0.5, "tooltip": "Worker reserved VRAM in GB. -1 inherits the server setting."}),
+                "worker_pinned_memory": ("BOOLEAN", {"default": False}),
+                "parallel_quant_load": ("BOOLEAN", {"default": False, "tooltip": "Load quantized worker models concurrently. Increases peak host RAM."}),
+                "collective_timeout_minutes": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 60.0, "step": 0.5}),
+                "numa_bind": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Bind each worker to the NUMA node its GPU is attached to. CPU affinity is intersected with the inherited affinity and host memory placement is preferred, not strict. Linux only, best effort.",
+                    },
+                ),
             },
         }
 
@@ -761,76 +833,6 @@ class RayInitializerAdvanced(RayInitializer):
 
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
-
-
-class RayPipeFusionConfig:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "ray_actors_init": ("RAY_ACTORS_INIT", {"tooltip": "Ray actor initialization payload to decorate with PipeFusion config."}),
-                "num_pipeline_patch": (
-                    "INT",
-                    {
-                        "default": 4,
-                        "min": 1,
-                        "tooltip": "How many smaller sequence chunks to split the sequence into after patch embedding. Higher values can reduce pipeline bubbles, but too high adds overhead.",
-                    },
-                ),
-                "warmup_steps": (
-                    "INT",
-                    {
-                        "default": 1,
-                        "min": 0,
-                        "tooltip": "How many denoising steps to run in simple synchronous mode before switching to steady-state PipeFusion scheduling. Since t0 usually required fresh KV (just like teacache warm up step)",
-                    },
-                ),
-                "pipefusion_stage_splits": (
-                    "STRING",
-                    {
-                        "default": "",
-                        "tooltip": "Optional manual block split per stage, for example for wan 14b `20,20`. Leave empty to split transformer blocks evenly across PP stages.",
-                    },
-                ),
-                "pipefusion_debug": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "tooltip": "Print extra PipeFusion logs such as stage ownership, chunk flow, and warmup/pipeline mode decisions.",
-                    },
-                ),
-            },
-        }
-
-    RETURN_TYPES = ("RAY_ACTORS_INIT",)
-    RETURN_NAMES = ("ray_actors_init",)
-
-    FUNCTION = "configure_pipefusion"
-    CATEGORY = "Raylight"
-
-    def configure_pipefusion(
-        self,
-        ray_actors_init,
-        num_pipeline_patch: int,
-        warmup_steps: int,
-        pipefusion_stage_splits: str = "",
-        pipefusion_debug: bool = False,
-    ):
-        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
-
-        updated_parallel_dict = dict(parallel_dict)
-        _apply_pipefusion_runtime_config(
-            updated_parallel_dict,
-            world_size=int(updated_parallel_dict.get("global_world_size", len(gpu_actors))),
-            num_pipeline_patch=num_pipeline_patch,
-            warmup_steps=warmup_steps,
-            stage_splits=pipefusion_stage_splits,
-            debug=pipefusion_debug,
-        )
-
-        updated_actor_fn = make_ray_actor_fn(int(updated_parallel_dict.get("global_world_size", len(gpu_actors))), updated_parallel_dict)
-        ray.get([actor.set_parallel_dict.remote(updated_parallel_dict) for actor in gpu_actors])
-        return ([ray_actors, updated_actor_fn],)
 
 
 class RayUNETLoader:
@@ -863,8 +865,16 @@ class RayUNETLoader:
 
     CATEGORY = "Raylight"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        #Re-run once the workers have been retired, so ensure_fresh_actors gets
+        #the chance to respawn them instead of the graph reusing dead handles.
+        return actor_generation()
+
+    @ray_model_loader
     def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora=None):
         ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
+        _free_host_models_if_contended(ray_actors)
 
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
@@ -884,6 +894,8 @@ class RayUNETLoader:
         except:
             unet_path = folder_paths.get_full_path_or_raise("checkpoints", unet_name)
 
+        ray_actors = {**ray_actors, "model_request": ("unet", unet_path, model_options, lora)}
+
         loaded_futures = []
         patched_futures = []
 
@@ -894,22 +906,16 @@ class RayUNETLoader:
 
         parallel_dict["is_quant"] = _quant_metadata_checker(unet_path)
         for actor in gpu_actors:
-            loaded_futures.append(actor.set_parallel_dict.remote(parallel_dict))
+            loaded_futures.append(actor.set_quantized.remote(parallel_dict["is_quant"]))
         ray.get(loaded_futures)
         loaded_futures = []
+
+        if all(ray.get([actor.check_model_loaded.remote(unet_path, model_options) for actor in gpu_actors])):
+            return (ray_actors,)
 
         if parallel_dict["is_fsdp"] is True:
             num_replicas = parallel_dict.get("dp_degree", 1)
             shard_size = parallel_dict.get("shard_size", len(gpu_actors))
-
-            # Reuse detection for FSDP non-quant: if the first worker already
-            # has this exact model + lora combo, all workers do (loaded together).
-            # Skip the expensive reload — handles MCP re-creating the same
-            # workflow and ComfyUI re-executing RayUNETLoader with identical inputs.
-            if parallel_dict["is_quant"] is False:
-                already_loaded = ray.get(gpu_actors[0].check_model_loaded.remote(unet_path, model_options))
-                if already_loaded:
-                    return (ray_actors,)
 
             if num_replicas <= 1:
                 # Single replica — all GPUs share one FSDP-sharded model
@@ -920,7 +926,7 @@ class RayUNETLoader:
 
                     for actor in gpu_actors:
                         if actor != worker0:
-                            loaded_futures.append(actor.set_meta_model.remote(meta_model))
+                            loaded_futures.append(actor.set_meta_model.remote(meta_model, unet_path, model_options))
 
                     ray.get(loaded_futures)
                     loaded_futures = []
@@ -930,7 +936,11 @@ class RayUNETLoader:
 
                 else:
                     for actor in gpu_actors:
-                        ray.get(actor.load_unet.remote(unet_path, model_options=model_options))
+                        future = actor.load_unet.remote(unet_path, model_options=model_options)
+                        if ray_actors["config"].loading.parallel_quant_load:
+                            loaded_futures.append(future)
+                        else:
+                            ray.get(future)
 
             else:
                 # Multiple replicas — load model per group
@@ -945,7 +955,7 @@ class RayUNETLoader:
 
                         for actor in group_actors:
                             if actor != worker0:
-                                loaded_futures.append(actor.set_meta_model.remote(meta_model))
+                                loaded_futures.append(actor.set_meta_model.remote(meta_model, unet_path, model_options))
 
                         ray.get(loaded_futures)
                         loaded_futures = []
@@ -955,7 +965,11 @@ class RayUNETLoader:
 
                     else:
                         for actor in group_actors:
-                            ray.get(actor.load_unet.remote(unet_path, model_options=model_options))
+                            future = actor.load_unet.remote(unet_path, model_options=model_options)
+                            if ray_actors["config"].loading.parallel_quant_load:
+                                loaded_futures.append(future)
+                            else:
+                                ray.get(future)
 
             ray.get(loaded_futures)
             loaded_futures = []
@@ -966,13 +980,12 @@ class RayUNETLoader:
             loaded_futures = []
 
         for actor in gpu_actors:
-            if parallel_dict["is_xdit"] and not parallel_dict.get("pipefusion_enabled"):
+            patched_futures.append(actor.patch_model_options.remote())
+            if parallel_dict["is_xdit"]:
                 if (parallel_dict["ulysses_degree"]) > 1 or (parallel_dict["ring_degree"] > 1):
                     patched_futures.append(actor.patch_usp.remote())
                 if parallel_dict["cfg_degree"] > 1:
                     patched_futures.append(actor.patch_cfg.remote())
-            if parallel_dict.get("pipefusion_enabled"):
-                patched_futures.append(actor.patch_pipefusion.remote())
 
         ray.get(patched_futures)
 
@@ -1169,6 +1182,7 @@ class XFuserKSamplerAdvanced:
         return_with_leftover_noise,
         denoise=1.0,
     ):
+        ray_actors = prepare_ray_model(ray_actors)
         # Clean VRAM for preparation to load model
         gc.collect()
         comfy.model_management.unload_all_models()
@@ -1181,6 +1195,7 @@ class XFuserKSamplerAdvanced:
             disable_noise = True
 
         gpu_actors = ray_actors["workers"]
+        progress.reset_cancel()
         futures = [
             actor.common_ksampler.remote(
                 noise_seed,
@@ -1196,11 +1211,17 @@ class XFuserKSamplerAdvanced:
                 start_step=start_at_step,
                 last_step=end_at_step,
                 force_full_denoise=force_full_denoise,
+                sampling_patches=ray_actors.get("sampling_patches", ()),
             )
             for actor in gpu_actors
         ]
 
-        results = ray.get(futures)
+        try:
+            results = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         return (results[0][0], ray_actors)
 
@@ -1273,6 +1294,7 @@ class UnifiedParallelSampler:
         denoise=1.0,
     ):
         ray_actors = ray_actors[0]
+        ray_actors = prepare_ray_model(ray_actors)
         add_noise = add_noise[0]
         steps = steps[0]
         cfg = cfg[0]
@@ -1302,6 +1324,7 @@ class UnifiedParallelSampler:
         positive = _normalize_grouped_inputs(positive, dp_degree, "positive")
         negative = _normalize_grouped_inputs(negative, dp_degree, "negative")
         latent_image = _normalize_grouped_inputs(latent_image, dp_degree, "latent_image")
+        progress.reset_cancel()
         futures = [
             actor.common_ksampler.remote(
                 noise_list[group_info["dp_rank"]],
@@ -1318,11 +1341,17 @@ class UnifiedParallelSampler:
                 last_step=end_at_step,
                 force_full_denoise=force_full_denoise,
                 grouped_output=True,
+                sampling_patches=ray_actors.get("sampling_patches", ()),
             )
             for actor, group_info in zip(gpu_actors, group_infos)
         ]
 
-        results = ray.get(futures)
+        try:
+            results = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         results = _collect_grouped_results(results, dp_degree, "Unified Parallel Sampler")
         return (results, ray_actors)
@@ -1391,6 +1420,7 @@ class DPKSamplerAdvanced:
         denoise=1.0,
     ):
         ray_actors = ray_actors[0]
+        ray_actors = prepare_ray_model(ray_actors)
         add_noise = add_noise[0]
         steps = steps[0]
         cfg = cfg[0]
@@ -1439,6 +1469,7 @@ class DPKSamplerAdvanced:
             disable_noise = True
 
         # Each GPU gets its own noise/conditioning — decoupled from FSDP sharding
+        progress.reset_cancel()
         futures = [
             actor.common_ksampler.remote(
                 noise_list[i],
@@ -1454,11 +1485,17 @@ class DPKSamplerAdvanced:
                 start_step=start_at_step,
                 last_step=end_at_step,
                 force_full_denoise=force_full_denoise,
+                sampling_patches=ray_actors.get("sampling_patches", ()),
             )
             for i, actor in enumerate(gpu_actors)
         ]
 
-        results = ray.get(futures)
+        try:
+            results = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         results = [result[0] for result in results]
         return (results, ray_actors)
@@ -1495,9 +1532,26 @@ class RayKill:
         if kill_mode == "Kill Entire Cluster":
             ray.shutdown()
             _cleanup_ray_temp()
-            RayControlNetLoader._current_controlnet_path = None
 
         return ()
+
+
+class RayKillInit:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "ray_actors_init": ("RAY_ACTORS_INIT",),
+            "kill_mode": (["Kill Workers Only", "Kill Entire Cluster"],),
+        }}
+
+    RETURN_TYPES = ()
+    FUNCTION = "kill_ray"
+    OUTPUT_NODE = True
+    CATEGORY = "Raylight"
+
+    def kill_ray(self, ray_actors_init, kill_mode):
+        ray_actors, _ = ray_actors_init
+        return RayKill().kill_ray(ray_actors, kill_mode)
 
 
 # Credit to : https://github.com/yolain/ComfyUI-Easy-Use
@@ -1531,12 +1585,9 @@ class RayControlNetLoader:
     worker's GPU from disk, avoiding Ray serialization of multi-GB weights.
     Returns a lightweight reference that RayControlNetApply uses.
 
-    Only one ControlNet model per workflow is supported. To apply the same
-    model with different images/strengths, use multiple RayControlNetApply
-    nodes connected to a single RayControlNetLoader.
+    Conditioning retains the selected model path so cached branches restore
+    the correct ControlNet and VAE before sampling.
     """
-
-    _current_controlnet_path = None
 
     @classmethod
     def INPUT_TYPES(s):
@@ -1554,16 +1605,6 @@ class RayControlNetLoader:
 
     def load_controlnet(self, ray_actors, control_net_name):
         controlnet_path = folder_paths.get_full_path_or_raise("controlnet", control_net_name)
-
-        if (RayControlNetLoader._current_controlnet_path is not None
-                and RayControlNetLoader._current_controlnet_path != controlnet_path):
-            raise RuntimeError(
-                f"Only one ControlNet model per workflow is supported. "
-                f"Already loaded '{RayControlNetLoader._current_controlnet_path}', "
-                f"attempted '{controlnet_path}'. Use multiple RayControlNetApply nodes "
-                f"to apply the same model with different images."
-            )
-        RayControlNetLoader._current_controlnet_path = controlnet_path
 
         # Validate the ControlNet loads in the main process first
         import comfy.controlnet as comfy_controlnet
@@ -1643,6 +1684,8 @@ class RayControlNetApply:
                         cond_hint_original=control_hint,
                         extra_concat_orig=extra_concat,
                         needs_vae=(ray_vae is not None),
+                        controlnet_path=ray_control_net,
+                        vae_path=ray_vae,
                     )
                     if prev_cnet is not None:
                         c_net.set_previous_controlnet(prev_cnet)
@@ -1797,12 +1840,12 @@ class RayVAEDecodeDistributed:
                         "min": 64,
                         "max": 4096,
                         "step": 32,
-                        "tooltip": "Tile size for spatial decoding. Larger tiles use more memory.",
+                        "tooltip": "Tile size for spatial decoding. Larger tiles use more memory. H3 uses its native decode settings instead.",
                     },
                 ),
                 "overlap": (
                     "INT",
-                    {"default": 64, "min": 0, "max": 4096, "step": 32, "tooltip": "Pixel overlap between tiles to prevent artifacts."},
+                    {"default": 64, "min": 0, "max": 4096, "step": 32, "tooltip": "Pixel overlap between spatial tiles. H3 uses its native decode settings instead."},
                 ),
                 "temporal_size": (
                     "INT",
@@ -1811,7 +1854,7 @@ class RayVAEDecodeDistributed:
                         "min": 8,
                         "max": 4096,
                         "step": 4,
-                        "tooltip": "Retained for workflow compatibility. Distributed video decoding always keeps the complete temporal sequence on one worker; this value is not used for tiling.",
+                        "tooltip": "Retained for workflow compatibility; unused. Stock H3 videos use native temporal chunks; other supported VAEs use spatial tiling.",
                     },
                 ),
                 "temporal_overlap": (
@@ -1821,7 +1864,7 @@ class RayVAEDecodeDistributed:
                         "min": 4,
                         "max": 4096,
                         "step": 4,
-                        "tooltip": "Retained for workflow compatibility. Distributed video decoding always keeps the complete temporal sequence on one worker; this value is not used for tiling.",
+                        "tooltip": "Retained for workflow compatibility; unused. Stock H3 temporal overlap is set by the VAE.",
                     },
                 ),
             }
@@ -1840,26 +1883,42 @@ class RayVAEDecodeDistributed:
             raise ValueError("Distributed VAE (Ray) requires at least one Ray worker.")
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
 
-        for actor in gpu_actors:
-            ray.get(actor.ray_vae_loader.remote(vae_path))
+        with _decode_session(ray_actors):
+            for actor in gpu_actors:
+                _gather_with_progress([actor.ray_vae_decode_load.remote(vae_path)], ray_actors, independent=True, progress_reader=lambda: None)
+            decode_mode = _gather_with_progress(
+                [gpu_actors[0].ray_vae_decode_mode.remote()], ray_actors, independent=True, progress_reader=lambda: None
+            )[0]
+            if decode_mode == "native" or (decode_mode == "temporal" and samples["samples"].shape[2] == 1):
+                image = _gather_with_progress(
+                    [gpu_actors[0].ray_vae_decode_native.remote(samples)], ray_actors,
+                    independent=True, progress_reader=lambda: decode_progress.read(["native"]),
+                )[0]
+                return (image,)
 
-        futures = [
-            actor.ray_vae_decode_partial.remote(
-                samples,
-                tile_size,
-                overlap=overlap,
-                temporal_size=temporal_size,
-                temporal_overlap=temporal_overlap,
-                job_rank=i,
-                job_world_size=len(gpu_actors),
-            )
-            for i, actor in enumerate(gpu_actors)
-        ]
-
-        worker_partials = ray.get(futures)
-        decoded = combine_dist_vae_partials(worker_partials)
-        image = ray.get(gpu_actors[0].ray_vae_decode_finalize.remote(decoded.cpu()))
-        return (image,)
+            parts = [f"rank{i}" for i in range(len(gpu_actors))] + ["combine", "finalize"]
+            if decode_mode == "temporal":
+                futures = [
+                    actor.ray_vae_decode_temporal_partial.remote(samples, job_rank=i, job_world_size=len(gpu_actors))
+                    for i, actor in enumerate(gpu_actors)
+                ]
+                partials, statuses = zip(*futures)
+                combined = gpu_actors[0].ray_vae_decode_temporal_combine.remote(*partials)
+            else:
+                futures = [
+                    actor.ray_vae_decode_partial.remote(
+                        samples, tile_size, overlap=overlap, temporal_size=temporal_size,
+                        temporal_overlap=temporal_overlap, job_rank=i, job_world_size=len(gpu_actors),
+                    )
+                    for i, actor in enumerate(gpu_actors)
+                ]
+                partials, statuses = zip(*futures)
+                combined = gpu_actors[0].ray_vae_decode_spatial_combine.remote(*partials)
+            # Watch small status refs as well as the result, without fetching raw tiles.
+            image = _gather_with_progress(
+                [*statuses, combined], ray_actors, independent=True, progress_reader=lambda: decode_progress.read(parts)
+            )[-1]
+            return (image,)
 
 
 class RaySeedVR2VAEDecodeDistributed:
@@ -1896,21 +1955,24 @@ class RaySeedVR2VAEDecodeDistributed:
         if not gpu_actors:
             raise ValueError("SeedVR2 distributed decode requires at least one Ray worker.")
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
-        ray.get([actor.ray_vae_loader.remote(vae_path) for actor in gpu_actors])
-
-        worker_partials = ray.get([
-            actor.ray_seedvr2_vae_decode_partial.remote(
-                samples,
-                tile_size,
-                overlap=overlap,
-                job_rank=i,
-                job_world_size=len(gpu_actors),
+        with _decode_session(ray_actors):
+            _gather_with_progress(
+                [actor.ray_vae_decode_load.remote(vae_path) for actor in gpu_actors], ray_actors,
+                independent=True, progress_reader=lambda: None,
             )
-            for i, actor in enumerate(gpu_actors)
-        ])
-        decoded = combine_seedvr2_vae_partials(worker_partials)
-        image = ray.get(gpu_actors[0].ray_vae_decode_finalize.remote(decoded))
-        return (image,)
+            futures = [
+                actor.ray_seedvr2_vae_decode_partial.remote(
+                    samples, tile_size, overlap=overlap, job_rank=i, job_world_size=len(gpu_actors),
+                )
+                for i, actor in enumerate(gpu_actors)
+            ]
+            partials, statuses = zip(*futures)
+            combined = gpu_actors[0].ray_seedvr2_vae_decode_combine.remote(*partials)
+            parts = [f"rank{i}" for i in range(len(gpu_actors))] + ["combine", "finalize"]
+            image = _gather_with_progress(
+                [*statuses, combined], ray_actors, independent=True, progress_reader=lambda: decode_progress.read(parts)
+            )[-1]
+            return (image,)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -1918,6 +1980,7 @@ NODE_CLASS_MAPPINGS = {
     "UnifiedParallelSampler": UnifiedParallelSampler,
     "DPKSamplerAdvanced": DPKSamplerAdvanced,
     "RayKill": RayKill,
+    "RayKillInit": RayKillInit,
     "RayUNETLoader": RayUNETLoader,
     "RayLoraLoader": RayLoraLoader,
     "RayMiniMaxH3TurboLora": RayMiniMaxH3TurboLora,
@@ -1940,6 +2003,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "UnifiedParallelSampler": "Unified Parallel Sampler (Advance)",
     "DPKSamplerAdvanced": "Data Parallel KSampler (Advanced)",
     "RayKill": "Kill Ray",
+    "RayKillInit": "Kill Ray (from Init)",
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",
     "RayMiniMaxH3TurboLora": "Load MiniMax-H3 Turbo LoRA (Ray)",

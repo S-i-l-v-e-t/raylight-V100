@@ -19,8 +19,9 @@ def test_quant_fsdp_workers_load_sequentially_and_materialize_locally():
     loader_source = ast.unparse(_function(NODES, "load_ray_unet"))
     worker_source = ast.unparse(_function(WORKER, "load_unet"))
 
-    assert loader_source.count("ray.get(actor.load_unet.remote(unet_path, model_options=model_options))") == 2
-    assert "if self.parallel_dict.get('is_quant', False):\n            self.set_state_dict()\n            self._patch_fsdp_for_sampling()" in worker_source
+    assert loader_source.count("if ray_actors['config'].loading.parallel_quant_load:") == 2
+    assert loader_source.count("ray.get(future)") == 2
+    assert worker_source.index("self.set_state_dict()") < worker_source.index("self._patch_fsdp_for_sampling()")
 
 
 def test_quant_fsdp_uses_private_spec_and_releases_consumed_state():
@@ -29,7 +30,7 @@ def test_quant_fsdp_uses_private_spec_and_releases_consumed_state():
     patcher_source = ast.unparse(_function(MODEL_PATCHER, "patch_fsdp"))
 
     assert "DTensor(quant_tensor, sharded_meta_param._spec, requires_grad=sharded_meta_param.requires_grad)" in loader_source
-    assert "_release_quant_keys(full_sd, param_name)" in loader_source
+    assert "_release_quant_keys(full_sd, param_name, keep=own_params)" in loader_source
     assert "release_sd=True" in patcher_source
     assert "input_scale" not in release_source
     assert "scale_input" not in release_source

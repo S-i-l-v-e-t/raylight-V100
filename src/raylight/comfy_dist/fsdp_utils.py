@@ -7,6 +7,7 @@ from typing import Any, cast
 import torch
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
+from comfy_kitchen.float_utils import from_blocked, to_blocked
 
 try:
     from comfy.quant_ops import QUANT_ALGOS, QuantizedTensor, get_layout_class
@@ -471,6 +472,32 @@ def _is_quant_param(param_name: str, full_sd: dict[str, Any], sharded_meta_param
     return False
 
 
+def _shard_mxfp8(qdata, scale, orig_shape, meta_param, device, orig_dtype):
+    rows, cols = orig_shape
+    start, end = 0, rows
+    local_rows = rows
+    if hasattr(meta_param, "device_mesh"):
+        mesh = meta_param.device_mesh
+        if mesh.ndim != 1:
+            raise NotImplementedError("MXFP8 FSDP requires a 1D mesh")
+        chunk_rows = (rows + mesh.size() - 1) // mesh.size()
+        # FSDP needs the same logical padded shard size even on the final rank.
+        local_rows = chunk_rows
+        start = min(mesh.get_local_rank() * chunk_rows, rows)
+        end = min(start + chunk_rows, rows)
+    scale_rows = from_blocked(scale.view(torch.uint8), num_rows=qdata.shape[0], num_cols=qdata.shape[1] // 32)
+    local_data = qdata[start:end].to(device=device)
+    local_scales = scale_rows[start:end].to(device=device)
+    padded_rows = ((local_rows + 31) // 32) * 32
+    local_data = torch.nn.functional.pad(local_data.view(torch.uint8), (0, 0, 0, padded_rows - (end - start))).view(qdata.dtype)
+    local_scales = torch.nn.functional.pad(local_scales, (0, 0, 0, padded_rows - (end - start)))
+    params = get_layout_class("TensorCoreMXFP8Layout").Params(
+        scale=to_blocked(local_scales, flatten=False).view(torch.float8_e8m0fnu),
+        orig_dtype=orig_dtype, orig_shape=(local_rows, cols),
+    )
+    return QuantizedTensor(local_data, "TensorCoreMXFP8Layout", params)
+
+
 def _build_quantized_tensor(
     param_name: str,
     full_sd: dict[str, Any],
@@ -490,9 +517,11 @@ def _build_quantized_tensor(
     full_q = full_sd.get(param_name)
     if isinstance(full_q, QuantizedTensor):
         qt = cast(Any, full_q)
+        if qt._layout_cls == "TensorCoreMXFP8Layout":
+            return _shard_mxfp8(qt._qdata, qt._params.scale, qt._params.orig_shape, sharded_meta_param, device, qt._params.orig_dtype)
         if qt._layout_cls not in ("TensorCoreFP8Layout", "TensorCoreFP8E4M3Layout", "TensorCoreFP8E5M2Layout"):
             raise NotImplementedError(
-                f"Raylight FSDP direct QuantizedTensor loading only supports FP8 layouts, got {qt._layout_cls} for {param_name}. "
+                f"Raylight FSDP direct QuantizedTensor loading only supports FP8 and MXFP8 layouts, got {qt._layout_cls} for {param_name}. "
                 "Use a comfy_quant state dict payload for supported formats or disable Raylight FSDP quant loading."
             )
         local_qdata = _shard_tensor(qt._qdata, sharded_meta_param, device, pad_to_local_meta=False)
@@ -511,11 +540,6 @@ def _build_quantized_tensor(
     quant_format = conf.get("format", None)
     if quant_format is None or quant_format not in QUANT_ALGOS:
         raise ValueError(f"Unknown quantization format for {param_name}: {quant_format}")
-    if quant_format == "mxfp8":
-        raise NotImplementedError(
-            "Raylight FSDP does not support MXFP8 quantized weights yet. "
-            "Use FP8/NVFP4 weights or disable Raylight FSDP quant loading."
-        )
     qconfig = QUANT_ALGOS[quant_format]
     layout_name = qconfig["comfy_tensor_layout"]
     layout_cls = get_layout_class(layout_name)
@@ -525,6 +549,12 @@ def _build_quantized_tensor(
     full_qdata = full_sd.get(param_name)
     if full_qdata is None:
         raise ValueError(f"Missing quantized weight for {param_name}")
+
+    if quant_format == "mxfp8":
+        scale = full_sd.get(f"{prefix}weight_scale")
+        if scale is None:
+            raise ValueError(f"Missing MXFP8 block scales for {param_name}")
+        return _shard_mxfp8(full_qdata, scale, tuple(sharded_meta_param.shape), sharded_meta_param, device, sharded_meta_param.dtype)
 
     qdata = full_qdata.to(dtype=qconfig["storage_t"])
     qdata = _shard_tensor(qdata, sharded_meta_param, device, pad_to_local_meta=False)
@@ -618,7 +648,11 @@ def _build_quantized_tensor(
     return QuantizedTensor(qdata, layout_name, params)
 
 
-def _release_quant_keys(full_sd: dict[str, Any], param_name: str) -> None:
+def _release_quant_keys(full_sd: dict[str, Any], param_name: str, keep: set[str] | None = None) -> None:
+    #A payload key can also be a parameter in its own right - a quantized
+    #embedding carries weight_scale that way - and it has not necessarily been
+    #loaded yet when the weight it belongs to frees the group. Releasing it
+    #leaves it on meta with its source gone.
     prefix = param_name[: -len("weight")]
     for key in (
         param_name,
@@ -631,7 +665,7 @@ def _release_quant_keys(full_sd: dict[str, Any], param_name: str) -> None:
         f"{prefix}quantized_block_scale",
         f"{prefix}quantized_block_min",
     ):
-        if key in full_sd:
+        if key in full_sd and (keep is None or key not in keep):
             full_sd[key] = None
 
 
@@ -647,7 +681,9 @@ def load_from_full_model_state_dict(
     release_sd=True,
 ):
     meta_sharded_sd = model.state_dict()
+    own_params = set(meta_sharded_sd)
     sharded_sd: dict[str, torch.Tensor] = {}
+    unsharded_params = []
     for param_name, sharded_meta_param in meta_sharded_sd.items():
         parent_module, leaf_name = _get_parent_module_and_name(model, param_name)
         is_buffer = leaf_name in parent_module._buffers
@@ -657,9 +693,8 @@ def load_from_full_model_state_dict(
                 if strict:
                     raise ValueError(f"Missing parameter {param_name} in state_dict")
                 continue
-            _materialize_unsharded_param(model, param_name, sharded_meta_param, full_tensor, device, cpu_offload)
-            if release_sd:
-                full_sd[param_name] = None
+            unsharded_params.append((param_name, sharded_meta_param, full_tensor))
+            sharded_sd[param_name] = full_tensor
             continue
 
         if not is_buffer and _is_quant_param(param_name, full_sd, sharded_meta_param):
@@ -678,9 +713,15 @@ def load_from_full_model_state_dict(
                 sharded_tensor = quant_tensor
             if cpu_offload:
                 sharded_tensor = sharded_tensor.cpu()
-            sharded_sd[param_name] = torch.nn.Parameter(sharded_tensor)
+            #Parameter defaults requires_grad to True, which undoes the freeze
+            #the wrapper applied and, for a quantized tensor that reports an
+            #integer dtype, raises outright. The meta parameter already carries
+            #the right answer, as it does for the DTensor above.
+            sharded_sd[param_name] = torch.nn.Parameter(
+                sharded_tensor, requires_grad=sharded_meta_param.requires_grad)
             if release_sd:
-                _release_quant_keys(full_sd, param_name)
+                own_params.discard(param_name)
+                _release_quant_keys(full_sd, param_name, keep=own_params)
             continue
         full_tensor = full_sd.get(param_name)
         if full_tensor is None:
@@ -701,9 +742,15 @@ def load_from_full_model_state_dict(
             )
         if cpu_offload:
             sharded_tensor = sharded_tensor.cpu()
-        sharded_sd[param_name] = sharded_tensor if is_buffer else torch.nn.Parameter(sharded_tensor)
+        sharded_sd[param_name] = sharded_tensor if is_buffer else torch.nn.Parameter(
+            sharded_tensor, requires_grad=sharded_meta_param.requires_grad)
         if release_sd:
+            own_params.discard(param_name)
             full_sd[param_name] = None
     out = model.load_state_dict(sharded_sd, strict=strict, assign=True)
+    for param_name, meta_param, full_tensor in unsharded_params:
+        _materialize_unsharded_param(model, param_name, meta_param, full_tensor, device, cpu_offload)
+        if release_sd:
+            full_sd[param_name] = None
     _materialize_missing_ignored_params(model, full_sd, device, strict, cpu_offload, release_sd)
     return out
