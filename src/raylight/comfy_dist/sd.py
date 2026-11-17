@@ -890,7 +890,10 @@ def lazy_load_diffusion_model(unet_path, model_options={}):
     lazy_sd = wrap_state_dict_lazy(sd)
 
     load_options = model_options.copy()
+    explicit_cast_dtype = load_options.pop("manual_cast_dtype", None)
     cast_dtype = load_options.pop("dtype", None)
+    if explicit_cast_dtype is not None:
+        cast_dtype = explicit_cast_dtype
     load_options.setdefault("custom_operations", SafetensorOps)
 
     model = comfy.sd.load_diffusion_model_state_dict(lazy_sd, model_options=load_options)
@@ -1114,9 +1117,11 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
         unet_dtype = dtype
 
     if model_config.quant_config is not None:
-        manual_cast_dtype = model_management.unet_manual_cast(None, load_device, model_config.supported_inference_dtypes)
+        # An explicit dtype request (e.g. fp16) wins; otherwise follow what the model declares.
+        manual_cast_dtype = model_options.get("dtype") or model_management.unet_manual_cast(None, load_device, model_config.supported_inference_dtypes)
     else:
         manual_cast_dtype = model_management.unet_manual_cast(unet_dtype, load_device, model_config.supported_inference_dtypes)
+    manual_cast_dtype = model_options.get("manual_cast_dtype", manual_cast_dtype)
     model_config.set_inference_dtype(unet_dtype, manual_cast_dtype, device=load_device)
 
     if custom_operations is not None:

@@ -10,6 +10,7 @@ from yunchang.kernels import AttnType
 from .sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_kernel
 from .inner_attention import INNER_ATTENTION_KEY, InnerAttentionDispatcher
 from .kitchen_attention import kitchen_attention
+from comfy.softbf16 import bf16_attn
 
 # FlashAttention for V100 (SM70) via flash-attention-v100 (1Cat cu128 build)
 _HAS_FLASH_V100 = False
@@ -110,6 +111,30 @@ def _patch_ring_lse_padding():
     kernels._raylight_lse_trimmed = True
 
 
+def _softbf16_ring_attn_factory(orig_ring_attn):
+    def ring_attn(q, k, v, *args, **kwargs):
+        # sm70 has no bf16 kernel in torch's attention backends, so bf16 runs the two
+        # products on fp16 tensor cores with per-tensor pow2 scaling (comfy/softbf16).
+        use_scaled = (
+            q.dtype == torch.bfloat16
+            and not kwargs.get("causal", False)
+            and kwargs.get("window_size", (-1, -1)) == (-1, -1)
+            and kwargs.get("alibi_slopes", None) is None
+            and kwargs.get("dropout_p", 0.0) == 0.0
+            and kwargs.get("attn_layer", None) is None
+            and kwargs.get("attn_processor", None) is None
+            and kwargs.get("joint_tensor_key", None) is None
+            and kwargs.get("joint_tensor_value", None) is None
+            and not kwargs.get("return_attn_probs", False)
+        )
+        if not use_scaled:
+            return orig_ring_attn(q, k, v, *args, **kwargs)
+        out = bf16_attn.attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                  scale=kwargs.get("softmax_scale", None))
+        return out.transpose(1, 2)
+    return ring_attn
+
+
 def make_xfuser_attention(attn_type, sync_ulysses):
     print(f"Using XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}")
     _patch_ring_lse_padding()
@@ -127,6 +152,10 @@ def make_xfuser_attention(attn_type, sync_ulysses):
         # Preserve Ulysses exchanges, replacing only the local computation. The
         # model-specific dispatcher below uses Kitchen as its dense fallback.
         xfuser_attn.ring_attn_fn = kitchen_attention
+    else:
+        # Ulysses exchanges are preserved; only the local computation changes, and
+        # only for bf16. Must be set before InnerAttentionDispatcher captures it.
+        xfuser_attn.ring_attn_fn = _softbf16_ring_attn_factory(xfuser_attn.ring_attn_fn)
     inner_dispatcher = InnerAttentionDispatcher(xfuser_attn)
     # NOTE: flash_attn_v100 (1Cat build) measured ~2x slower than torch
     # mem-efficient (TORCH_EFFICIENT) on V100 dense prefill; override disabled.

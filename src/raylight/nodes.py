@@ -849,6 +849,8 @@ class RayUNETLoader:
                         "fp8_e5m2",
                         "bf16",
                         "fp16",
+                        "fp8e4m3fn_bf16",
+                        "fp8e5m2_bf16",
                     ],
                 ),
                 "ray_actors_init": (
@@ -879,11 +881,21 @@ class RayUNETLoader:
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
             model_options["dtype"] = torch.float8_e4m3fn
+            model_options["manual_cast_dtype"] = torch.float16
         elif weight_dtype == "fp8_e4m3fn_fast":
             model_options["dtype"] = torch.float8_e4m3fn
+            model_options["manual_cast_dtype"] = torch.float16
             model_options["fp8_optimizations"] = True
         elif weight_dtype == "fp8_e5m2":
             model_options["dtype"] = torch.float8_e5m2
+            model_options["manual_cast_dtype"] = torch.float16
+        elif weight_dtype == "fp8e4m3fn_bf16":
+            # W8A16: fp8 weights stay in VRAM, bf16 activations run on scaled fp16 tensor cores.
+            model_options["dtype"] = torch.float8_e4m3fn
+            model_options["manual_cast_dtype"] = torch.bfloat16
+        elif weight_dtype == "fp8e5m2_bf16":
+            model_options["dtype"] = torch.float8_e5m2
+            model_options["manual_cast_dtype"] = torch.bfloat16
         elif weight_dtype == "bf16":
             model_options["dtype"] = torch.bfloat16
         elif weight_dtype == "fp16":
