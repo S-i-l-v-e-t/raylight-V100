@@ -10,7 +10,7 @@ from yunchang.kernels import AttnType
 from .sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_kernel
 from .inner_attention import INNER_ATTENTION_KEY, InnerAttentionDispatcher
 from .kitchen_attention import kitchen_attention
-from comfy.softbf16 import bf16_attn
+import bf16_attn
 
 # FlashAttention for V100 (SM70) via flash-attention-v100 (1Cat cu128 build)
 _HAS_FLASH_V100 = False
