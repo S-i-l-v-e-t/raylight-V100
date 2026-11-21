@@ -270,6 +270,7 @@ def _worker_cli_args_env_json(config: RayWorkerConfig) -> str:
         "vram_headroom": config.vram_headroom,
         "force_non_blocking": bool(comfy_args.force_non_blocking),
         "deterministic": bool(comfy_args.deterministic),
+        "fp32_unet": bool(comfy_args.fp32_unet),
         "verbose": comfy_args.verbose,
         "reserve_vram": config.reserve_vram,
         "fp16_intermediates": bool(comfy_args.fp16_intermediates),
@@ -851,6 +852,7 @@ class RayUNETLoader:
                         "fp16",
                         "fp8e4m3fn_bf16",
                         "fp8e5m2_bf16",
+                        "fp8e4m3fn_fp32",
                     ],
                 ),
                 "ray_actors_init": (
@@ -893,6 +895,10 @@ class RayUNETLoader:
             # W8A16: fp8 weights stay in VRAM, bf16 activations run on scaled fp16 tensor cores.
             model_options["dtype"] = torch.float8_e4m3fn
             model_options["manual_cast_dtype"] = torch.bfloat16
+        elif weight_dtype == "fp8e4m3fn_fp32":
+            # W8A32 reference: fp8 weights dequantized per layer, fp32 activations and GEMMs.
+            model_options["dtype"] = torch.float8_e4m3fn
+            model_options["manual_cast_dtype"] = torch.float32
         elif weight_dtype == "fp8e5m2_bf16":
             model_options["dtype"] = torch.float8_e5m2
             model_options["manual_cast_dtype"] = torch.bfloat16
