@@ -1,7 +1,7 @@
 import torch
 
 import comfy.model_management as model_management
-from comfy.ldm.minimax.vae import MiniMaxH3VideoVAE
+from comfy.ldm.minimax.vae import H3ImageVAE, MiniMaxH3VideoVAE
 from raylight import decode_progress
 
 
@@ -125,6 +125,9 @@ def _compute_feather(upscale, overlap_latent, spatial_dims):
 
 def vae_decode_mode(vae):
     model = vae.first_stage_model
+    if isinstance(model, H3ImageVAE):
+        # single-frame 2D decoders own the whole image, nothing to split temporally
+        return "native"
     if isinstance(model, MiniMaxH3VideoVAE):
         return "native" if model.noncausal else "temporal"
     return "spatial"
@@ -133,7 +136,20 @@ def vae_decode_mode(vae):
 def ray_vae_decode_native_impl(worker, samples):
     decode_progress.check_cancel(force=True)
     decode_progress.write("native", 0, 1)
-    images = worker.vae_model.decode(samples["samples"])
+    vae = worker.vae_model
+    # Decode straight on the VAE model instead of going through VAE.decode: the HF
+    # VAEs tile internally and their decoder owns the whole frame, so comfy's outer
+    # batching/tiling fallback adds nothing, while its load_models_gpu call walks
+    # the worker's global model list and spiked past the free VRAM right before decoding.
+    vae_model = vae.first_stage_model
+    if next(vae_model.parameters()).device != vae.device:
+        vae_model.to(device=vae.device)
+    # The VAE parameters keep requires_grad=True, and a Ray task does not inherit
+    # the sampler's inference context: without this the whole decode builds an
+    # autograd graph and holds every intermediate (measured 30 GiB vs 1.2 GiB).
+    with torch.inference_mode(), model_management.cuda_device_context(vae.device):
+        images = vae_model.decode(samples["samples"].to(device=vae.device, dtype=vae.vae_dtype))
+    images = images.to(vae.output_device).movedim(1, -1)
     if images.ndim == 5:
         images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
     images = images.cpu()
@@ -166,7 +182,7 @@ def ray_vae_decode_temporal_partial_impl(worker, samples, job_rank=0, job_world_
         memory_used = vae.memory_used_decode(latent.shape, vae.vae_dtype)
         model_management.load_models_gpu([vae.patcher], memory_required=memory_used, force_full_load=vae.disable_offload)
 
-        with model_management.cuda_device_context(vae.device):
+        with torch.inference_mode(), model_management.cuda_device_context(vae.device):
             for chunk_index in chunk_indices:
                 decode_progress.check_cancel()
                 start = chunk_index * model.tokens_chunk_size
@@ -341,7 +357,7 @@ def ray_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, temporal
 
         tiles = []
         job_index = 0
-        with model_management.cuda_device_context(vae.device):
+        with torch.inference_mode(), model_management.cuda_device_context(vae.device):
             for x, x_end in tile_ranges:
                 if job_index % job_world_size == job_rank:
                     decode_progress.check_cancel()
@@ -382,7 +398,7 @@ def ray_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, temporal
 
             tiles = []
             job_index = 0
-            with model_management.cuda_device_context(vae.device):
+            with torch.inference_mode(), model_management.cuda_device_context(vae.device):
                 for y, y_end, x, x_end in tile_ranges:
                     if job_index % job_world_size == job_rank:
                         decode_progress.check_cancel()
@@ -417,7 +433,7 @@ def ray_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, temporal
 
         tiles = []
         job_index = 0
-        with model_management.cuda_device_context(vae.device):
+        with torch.inference_mode(), model_management.cuda_device_context(vae.device):
             for y, y_end, x, x_end in tile_ranges:
                 if job_index % job_world_size == job_rank:
                     decode_progress.check_cancel()

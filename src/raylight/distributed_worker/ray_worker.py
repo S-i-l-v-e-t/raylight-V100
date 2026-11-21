@@ -1252,7 +1252,8 @@ class RayWorker:
     def ray_vae_encode(self, pixel_samples):
         if self.vae_model is None:
             raise RuntimeError("No VAE loaded on this Ray worker; connect RayVAELoader before using worker VAE encode")
-        return self.vae_model.encode(pixel_samples)
+        with torch.inference_mode():
+            return self.vae_model.encode(pixel_samples)
 
     def ray_vae_decode(self, samples):
         if self.vae_model is None:
