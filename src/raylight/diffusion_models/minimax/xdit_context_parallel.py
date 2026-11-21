@@ -3,7 +3,7 @@ import math
 
 import comfy
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3FunControlBlockPatch
-from comfy.ldm.minimax.model import _mod_gate, _mod_scale_shift, AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP, PackedLayout, mask_row_values, pack_audio, patchify_video, rope_rotation_table, time_shift_sigma, unpack_audio, unpatchify_video
+from comfy.ldm.minimax.model import _mod_gate, _mod_scale_shift, AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP, SEG_TAG, PackedLayout, mask_row_values, pack_audio, patchify_video, rope_rotation_table, time_shift_sigma, unpack_audio, unpatchify_video
 from comfy.ldm.modules.attention import attention_pytorch
 from xfuser.core.distributed import get_sequence_parallel_rank, get_sequence_parallel_world_size, get_sp_group
 
@@ -421,3 +421,131 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     audio_out = unpack_audio(a)
 
     return [-video_out.to(video_x.dtype), -audio_out.to(audio_x.dtype)]
+
+
+def usp_image_forward(self, x, timestep, context, transformer_options={}, minimax_payload=None, **kwargs):
+    """MiniMax-H3-Image under sequence parallel: the H3 DiT without the audio stream,
+    denoising one latent frame. Packed sequence [text | reference images | target]."""
+    orig_h, orig_w = x.shape[3], x.shape[4]
+    x = comfy.ldm.common_dit.pad_to_patch_size(x, self.patch_size)
+    if x.shape[0] != 1:
+        raise ValueError("MiniMax H3 supports batch size 1")
+    payload = minimax_payload or {}
+    device = x.device
+    dtype = context.dtype  # compute dtype
+
+    latent_t, lat_h, lat_w = x.shape[2], x.shape[3], x.shape[4]
+    text_len = context.shape[1]
+    # extra_conds prebuilds the layout once per sampling run
+    layout = payload.get("layout")
+    if layout is None or layout.signature != (text_len, latent_t, lat_h, lat_w, 0):
+        layout = PackedLayout(text_len, latent_t, lat_h, lat_w, 0, refs=payload.get("refs"))
+    transformer_options["minimax_h3_layout"] = layout
+
+    # model_base passes model_sampling.timestep(sigma) = sigma * 1000
+    sigma = float(timestep.flatten()[0]) / 1000.0
+    t = 1.0 - sigma
+
+    # distinct timesteps are known analytically: text/pad follow the target, reference rows pin near 1
+    vis_aug = float(payload.get("visual_cond_noise_aug", VISUAL_COND_TIMESTEP))
+    seg_t = {"text": t, "video": t, "ref_img": max(t, vis_aug)}
+    unique_t = sorted({seg_t[k] for _, _, k in layout.segments})
+    t_row = {v: i for i, v in enumerate(unique_t)}
+
+    text_tags = payload.get("text_token_tags")
+    mod_segments = []
+    for a, b, kind in layout.segments:
+        row_base = t_row[seg_t[kind]] * 3
+        if kind == "text" and text_tags is not None:
+            # the presentation text span mixes tags (vision pads carry the video modality) split into tag runs
+            tags = text_tags.view(-1).tolist()
+            run_start = 0
+            for i in range(1, b - a + 1):
+                if i == b - a or tags[i] != tags[run_start]:
+                    mod_segments.append((a + run_start, a + i, row_base + int(tags[run_start])))
+                    run_start = i
+        else:
+            mod_segments.append((a, b, row_base + SEG_TAG[kind]))
+
+    # embed
+    img_update = layout.img_update.to(device)
+    video_rows = patchify_video(x.to(torch.float32), self.patch_size)
+    cond_video_rows = self._cond_video_rows(payload, device)
+    all_video_rows = video_rows
+    if cond_video_rows is not None:
+        all_video_rows = torch.empty(img_update.shape[0], video_rows.shape[1], dtype=torch.float32, device=device)
+        all_video_rows[~img_update] = cond_video_rows
+        all_video_rows[img_update] = video_rows
+
+    text_states = context[0]
+    if text_states.shape[-1] != self.hidden_size:
+        text_states = self.token_refiner(self.condition_proj(text_states),
+                                         transformer_options=transformer_options)
+
+    # Only this rank's slice is built. zeros, not empty: the padding to the world size
+    # is covered by no segment.
+    h_orig_size = layout.seq_len
+    start, end = _local_range(h_orig_size)
+    residual_dtype = torch.float32 if self.raylight_fp32_residual else dtype
+    h = torch.zeros(end - start, self.hidden_size, dtype=residual_dtype, device=device)
+    video_pieces = []
+    voff = 0
+    for a, b, kind in layout.segments:
+        n = b - a
+        lo, hi = max(a, start), min(b, end)
+        if kind == "text":
+            if lo < hi:
+                h[lo - start:hi - start] = text_states[lo - a:hi - a]
+        else:
+            if lo < hi:
+                video_pieces.append((lo - start, hi - start, voff + lo - a))
+            voff += n
+    # video_patch_proj is an FSDP module, so its forward is a collective: every rank
+    # calls it exactly once, on all of its rows, even when it holds none
+    _embed_pieces(h, self.video_patch_proj, all_video_rows, video_pieces, dtype)
+
+    t_emb = self._time_embedding(unique_t, device, dtype)
+    # rotation table computed once per forward, consumed by the kitchen split-half rope
+    rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
+    # ===================== SP SPLIT ====================== #
+    rope_freqs, _ = pad_to_world_size(rope_freqs, dim=1)
+    rope_freqs = rope_freqs[:, start:end]
+    mod_segments = _localize_segments(mod_segments, start, end)
+    transformer_options['sp_start'] = start
+    transformer_options['sp_end'] = end
+
+    # blocks
+    patches_replace = transformer_options.get("patches_replace", {})
+    blocks_replace = patches_replace.get("dit", {})
+    prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.blocks), device, transformer_options)
+    for i, block in enumerate(self.blocks):
+        comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block)
+        transformer_options["block_index"] = i
+        if ("double_block", i) in blocks_replace:
+            def block_wrap(args):
+                if args.get("attention") is not None and get_sequence_parallel_world_size() > 1:
+                    raise ValueError("MiniMax H3 block attention patches need full sequence; use Raylight SLA for USP")
+                return {"img": block(args["img"], args["t_emb"], args["mod_segments"], args["rope_freqs"],
+                                     transformer_options=args["transformer_options"], attention=args.get("attention"))}
+            h = blocks_replace[("double_block", i)](
+                {"img": h, "t_emb": t_emb, "mod_segments": mod_segments, "rope_freqs": rope_freqs,
+                 "layout": layout, "transformer_options": transformer_options},
+                {"original_block": block_wrap})["img"]
+        else:
+            h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
+    if prefetch_queue is not None:
+        comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
+
+    # ===================== SP GATHER ===================== #
+    # the head is row-local, so it runs on this rank's rows and only its outputs
+    # are gathered, not the full-width residual
+    va, vb, _ = layout.segments[-1]  # the target image is the last segment
+    video_seg = (va, vb, t_row[t])
+    local_video = _localize_segments([video_seg], start, end)
+    # a rank holding no target rows still runs one row of it, and drops it
+    v_seg = local_video[0] if local_video else (0, 1, video_seg[2])
+    v, = self.final_layer(h, t_emb, v_seg, None, sigma, transformer_options.get("sample_sigmas"), (self.pdd_sigmas,))
+    v = _gather_stream(v, local_video, end - start)[va:vb]
+
+    out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
+    return -out[:, :, :, :orig_h, :orig_w].to(x.dtype)

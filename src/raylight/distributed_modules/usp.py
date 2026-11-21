@@ -422,13 +422,11 @@ if hasattr(model_base, "QwenImage"):
 
 if hasattr(model_base, "MiniMaxH3"):
 
-    @USPInjectRegistry.register(model_base.MiniMaxH3)
-    def _inject_minimax_h3(model_patcher, base_model, *args):
+    def _patch_minimax_h3_blocks(model_patcher, model):
         from ..comfy_dist.model_patcher import FSDPModelPatcher
         from ..comfy_dist.sd import FSDP_LORA_SIDECAR_ATTACHMENT
-        from ..diffusion_models.minimax.xdit_context_parallel import usp_attn_forward, usp_block_forward, usp_dit_forward, usp_mlp_forward
+        from ..diffusion_models.minimax.xdit_context_parallel import usp_attn_forward, usp_block_forward, usp_mlp_forward
 
-        model = base_model.diffusion_model
         sidecar_groups = model_patcher.get_attachment(FSDP_LORA_SIDECAR_ATTACHMENT) or {}
         options = model_patcher.get_attachment("raylight_model_options").minimax
         attention_fp16 = options.attention_fp16
@@ -459,6 +457,23 @@ if hasattr(model_base, "MiniMaxH3"):
             block.mlp.raylight_chunk_tokens = 0
             block.mlp.raylight_unfused_mlp = sidecar or unfused_mlp
             block.mlp.forward = types.MethodType(usp_mlp_forward, block.mlp)
+
+    if hasattr(model_base, "MiniMaxH3Image"):
+
+        @USPInjectRegistry.register(model_base.MiniMaxH3Image)
+        def _inject_minimax_h3_image(model_patcher, base_model, *args):
+            from ..diffusion_models.minimax.xdit_context_parallel import usp_image_forward
+
+            model = base_model.diffusion_model
+            _patch_minimax_h3_blocks(model_patcher, model)
+            model._forward = types.MethodType(usp_image_forward, model)
+
+    @USPInjectRegistry.register(model_base.MiniMaxH3)
+    def _inject_minimax_h3(model_patcher, base_model, *args):
+        from ..diffusion_models.minimax.xdit_context_parallel import usp_dit_forward
+
+        model = base_model.diffusion_model
+        _patch_minimax_h3_blocks(model_patcher, model)
         model._forward = types.MethodType(usp_dit_forward, model)
 
 
